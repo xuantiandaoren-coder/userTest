@@ -10,6 +10,7 @@ import pytest
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
+from app.core.storage import DocCategory, InvalidDocCategoryError, normalize_doc_category
 from app.db.models import Resource, User
 from tests.conftest import FakeSeaweedFSClient
 
@@ -22,6 +23,27 @@ PNG_BYTES = base64.b64decode(
 )
 TXT_BYTES = b"hello upload\n"
 MP3_BYTES = b"ID3\x03\x00\x00\x00\x00\x00\x00audio-payload"
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (None, None),
+        ("", None),
+        ("   ", None),
+        ("Resume", DocCategory.RESUME),
+        (" study_material ", DocCategory.STUDY_MATERIAL),
+        ("GENERAL", DocCategory.GENERAL),
+    ],
+)
+def test_normalize_doc_category(raw: str | None, expected: DocCategory | None) -> None:
+    """空串 / 空白视为可空，合法值大小写与首尾空白都能归一化。"""
+    assert normalize_doc_category(raw) == expected
+
+
+def test_normalize_doc_category_rejects_unknown_value() -> None:
+    with pytest.raises(InvalidDocCategoryError):
+        normalize_doc_category("cv")
 
 
 async def _login(client: httpx.AsyncClient, username: str) -> dict[str, str]:
@@ -143,6 +165,137 @@ async def test_audio_is_detected_as_audio_resource(
     assert response.json()["kind"] == "audio"
     assert response.json()["resource_type"] == 2
     assert _resource(db_session, _user_id(db_session, "audiouploader")).resource_type == 2
+
+
+@pytest.mark.anyio
+async def test_document_doc_category_is_persisted(
+    db_override: None,
+    db_session: Session,
+    storage_override: FakeSeaweedFSClient,
+    httpx_client: httpx.AsyncClient,
+) -> None:
+    """文件类型可带文档分类：请求值原样落库，并在响应里回显。"""
+    headers = await _login(httpx_client, "resumeuploader")
+
+    response = await httpx_client.post(
+        UPLOAD,
+        files={"file": ("resume.txt", TXT_BYTES, "text/plain")},
+        data={"doc_category": "resume"},
+        headers=headers,
+    )
+
+    assert response.status_code == 201
+    body = response.json()
+    assert body["kind"] == "document"
+    assert body["doc_category"] == "resume"
+    row = _resource(db_session, _user_id(db_session, "resumeuploader"))
+    assert row.doc_category == "resume"
+
+
+@pytest.mark.anyio
+async def test_document_doc_category_is_optional(
+    db_override: None,
+    db_session: Session,
+    storage_override: FakeSeaweedFSClient,
+    httpx_client: httpx.AsyncClient,
+) -> None:
+    """文档分类可空：不传、传空串都落 NULL，不报错。"""
+    headers = await _login(httpx_client, "nocategory")
+
+    omitted = await httpx_client.post(
+        UPLOAD, files={"file": ("a.txt", b"no category", "text/plain")}, headers=headers
+    )
+    empty = await httpx_client.post(
+        UPLOAD,
+        files={"file": ("b.txt", b"blank category", "text/plain")},
+        data={"doc_category": ""},
+        headers=headers,
+    )
+
+    assert omitted.status_code == 201
+    assert omitted.json()["doc_category"] is None
+    assert empty.status_code == 201
+    assert empty.json()["doc_category"] is None
+    rows = db_session.query(Resource).filter_by(user_id=_user_id(db_session, "nocategory")).all()
+    assert [row.doc_category for row in rows] == [None, None]
+
+
+@pytest.mark.anyio
+async def test_doc_category_is_ignored_for_non_document(
+    db_override: None,
+    db_session: Session,
+    storage_override: FakeSeaweedFSClient,
+    httpx_client: httpx.AsyncClient,
+) -> None:
+    """仅文件类型有意义：图片 / 音频传了文档分类也不落库。"""
+    headers = await _login(httpx_client, "imgcategory")
+
+    response = await httpx_client.post(
+        UPLOAD,
+        files={"file": ("pic.png", PNG_BYTES, "image/png")},
+        data={"doc_category": "resume"},
+        headers=headers,
+    )
+
+    assert response.status_code == 201
+    assert response.json()["doc_category"] is None
+    assert _resource(db_session, _user_id(db_session, "imgcategory")).doc_category is None
+
+
+@pytest.mark.anyio
+async def test_invalid_doc_category_is_rejected(
+    db_override: None,
+    db_session: Session,
+    storage_override: FakeSeaweedFSClient,
+    httpx_client: httpx.AsyncClient,
+) -> None:
+    headers = await _login(httpx_client, "badcategory")
+
+    response = await httpx_client.post(
+        UPLOAD,
+        files={"file": ("a.txt", TXT_BYTES, "text/plain")},
+        data={"doc_category": "not-a-category"},
+        headers=headers,
+    )
+
+    assert response.status_code == 422
+    assert response.json()["code"] == "INVALID_DOC_CATEGORY"
+    assert db_session.query(Resource).count() == 0  # 脏值不落库
+    assert storage_override.objects == {}
+
+
+@pytest.mark.anyio
+async def test_dedup_updates_doc_category(
+    db_override: None,
+    db_session: Session,
+    storage_override: FakeSeaweedFSClient,
+    httpx_client: httpx.AsyncClient,
+) -> None:
+    """重复上传同一内容时，显式带来的分类会覆盖旧值；不传则保留。"""
+    headers = await _login(httpx_client, "recategorize")
+
+    first = await httpx_client.post(
+        UPLOAD,
+        files={"file": ("notes.txt", b"same content", "text/plain")},
+        data={"doc_category": "general"},
+        headers=headers,
+    )
+    second = await httpx_client.post(
+        UPLOAD,
+        files={"file": ("notes.txt", b"same content", "text/plain")},
+        data={"doc_category": "study_material"},
+        headers=headers,
+    )
+    third = await httpx_client.post(
+        UPLOAD, files={"file": ("notes.txt", b"same content", "text/plain")}, headers=headers
+    )
+
+    assert first.json()["doc_category"] == "general"
+    assert second.json()["deduplicated"] is True
+    assert second.json()["doc_category"] == "study_material"
+    assert third.json()["doc_category"] == "study_material"  # 不传时保留已有分类
+    assert db_session.query(Resource).filter_by(user_id=_user_id(db_session, "recategorize")).count() == 1
+    assert _resource(db_session, _user_id(db_session, "recategorize")).doc_category == "study_material"
 
 
 @pytest.mark.anyio

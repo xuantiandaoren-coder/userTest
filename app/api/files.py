@@ -1,6 +1,7 @@
 """路由层：需认证的通用文件上传接口。
 
-类型识别与存储规则在 app/services/upload_service_seaweedfs.py；
+类型识别与存储规则在 app/services/upload_service_seaweedfs.py，
+文件类型的向量化入库在 app/services/rag_service.py；
 本层只负责鉴权、参数声明与响应。
 """
 
@@ -18,7 +19,7 @@ router = APIRouter(tags=["files"])
     "/files/upload",
     response_model=UploadResult,
     status_code=status.HTTP_201_CREATED,
-    summary="上传文件（需登录；对象存 SeaweedFS，元数据存 MySQL）",
+    summary="上传文件（需登录；对象存 SeaweedFS，元数据存 MySQL；文件类型自动向量化入库）",
 )
 @router.post(
     "/upload/file",
@@ -32,6 +33,10 @@ async def upload_file(
     service: UploadServiceDep,
     storage_scene: Annotated[int, Form(ge=0, le=2, description="0=长过期(1个月)，1=短过期(2小时)，2=只提取内容")] = 0,
     upload_purpose: Annotated[int, Form(ge=0, le=1, description="0=普通资源，1=用户头像")] = 0,
+    doc_category: Annotated[
+        str | None,
+        Form(description="文档分类：resume/study_material/general；仅文件类型有意义，可空"),
+    ] = None,
 ) -> UploadResult:
     """登录用户上传文件：按内容识别类型，原文件存 SeaweedFS，元数据写 resources 表。"""
     return await service.upload(
@@ -39,4 +44,5 @@ async def upload_file(
         file,
         storage_scene=storage_scene,
         upload_purpose=upload_purpose,
+        doc_category=doc_category,
     )

@@ -229,6 +229,7 @@ class Resource(Base):
     """资源元数据表：原文件存 SeaweedFS，本表只存元数据，两者解耦。
 
     - resource_type：0=文件，1=图片，2=音频
+    - doc_category：文档分类（resume/study_material/general），仅 resource_type=0(文件) 有意义，其余为 NULL
     - storage_scene：0=长过期（1 个月），1=短过期（2 小时），2=只提取内容不存原文件
     - upload_purpose：0=普通资源，1=用户头像（仅图片会把对象键写进 user.avatar）
     - file_hash：文件内容 MD5；(file_hash, user_id) 唯一索引实现用户级去重
@@ -246,6 +247,11 @@ class Resource(Base):
         tiny_int(),
         nullable=False,
         comment="资源类型：0=文件，1=图片，2=音频",
+    )
+    doc_category: Mapped[str | None] = mapped_column(
+        String(32),
+        nullable=True,
+        comment="文档分类：resume/study_material/general；仅文件类型(resource_type=0)有意义，其余为空",
     )
     storage_scene: Mapped[int] = mapped_column(
         tiny_int(),

@@ -178,5 +178,8 @@ def test_resources_table_exists_after_migration(tmp_path) -> None:
         assert "resources" in inspector.get_table_names()
         index_names = {index["name"] for index in inspector.get_indexes("resources")}
         assert "uk_file_hash_user_id" in index_names
+        columns = {column["name"]: column for column in inspector.get_columns("resources")}
+        assert "doc_category" in columns
+        assert columns["doc_category"]["nullable"] is True  # 文档分类可空，且仅文件类型有意义
     finally:
         engine.dispose()

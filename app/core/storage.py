@@ -35,6 +35,18 @@ class FileKind(str, Enum):
     AUDIO = "audio"
 
 
+class DocCategory(str, Enum):
+    """文档分类：仅文件类型（resource_type=0）有意义，图片 / 音频恒为空。"""
+
+    RESUME = "resume"
+    STUDY_MATERIAL = "study_material"
+    GENERAL = "general"
+
+
+# 文档分类取值清单，用于校验与提示
+DOC_CATEGORIES: tuple[str, ...] = tuple(category.value for category in DocCategory)
+
+
 # resource_type：0=文件，1=图片，2=音频（与 resources 表注释一致）
 RESOURCE_TYPE_BY_KIND: dict[FileKind, int] = {
     FileKind.DOCUMENT: 0,
@@ -49,6 +61,14 @@ class UnsupportedFileTypeError(BusinessError):
     code = "UNSUPPORTED_FILE_TYPE"
     http_status = 415
     message = "不支持的文件类型"
+
+
+class InvalidDocCategoryError(BusinessError):
+    """业务异常：文档分类不在 resume/study_material/general 之内。"""
+
+    code = "INVALID_DOC_CATEGORY"
+    http_status = 422
+    message = "文档分类不合法"
 
 
 class FileTooLargeError(BusinessError):
@@ -233,3 +253,20 @@ def safe_extension(file_name: str) -> str:
     """取安全扩展名（小写、白名单字符），拿不到则返回空串。"""
     suffix = Path(file_name).suffix.lstrip(".").lower()
     return suffix if _SAFE_EXTENSION.match(suffix) else ""
+
+
+def normalize_doc_category(value: str | None) -> DocCategory | None:
+    """归一化文档分类：None / 空串 / 纯空白一律视为未分类（None）。
+
+    取值只允许 resume / study_material / general（大小写不敏感），
+    其他值抛 InvalidDocCategoryError（422），避免脏值落库。
+    """
+    if value is None:
+        return None
+    normalized = value.strip().lower()
+    if not normalized:
+        return None
+    try:
+        return DocCategory(normalized)
+    except ValueError:
+        raise InvalidDocCategoryError(detail=f"doc_category={value!r} allowed={list(DOC_CATEGORIES)}") from None

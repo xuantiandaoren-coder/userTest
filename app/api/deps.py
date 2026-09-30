@@ -23,6 +23,7 @@ from app.db.user_profile_repository import UserProfileRepository
 from app.llm.llm import get_chat_model
 from app.prompts.prompt_template_manager import PromptTemplateManager
 from app.services.chat_service import ChatService
+from app.services.rag_service import RagIngestService
 from app.services.stream_chat_service import StreamChatService
 from app.services.upload_service_seaweedfs import SeaweedFSUploadService
 from app.services.user_service import UserService
@@ -44,9 +45,21 @@ def get_user_service(db: Annotated[Session, Depends(get_db)], storage: StorageCl
 ServiceDep = Annotated[UserService, Depends(get_user_service)]
 
 
-def get_upload_service(db: Annotated[Session, Depends(get_db)], storage: StorageClientDep) -> SeaweedFSUploadService:
-    """依赖注入：上传服务（元数据仓储 + 用户仓储 + 对象存储客户端）。"""
-    return SeaweedFSUploadService(ResourceRepository(db), UserRepository(db), storage)
+def get_rag_ingest_service() -> RagIngestService:
+    """依赖注入：RAG 向量化入库服务（测试可整体替换为假实现，避免连向量库）。"""
+    return RagIngestService()
+
+
+RagIngestServiceDep = Annotated[RagIngestService, Depends(get_rag_ingest_service)]
+
+
+def get_upload_service(
+    db: Annotated[Session, Depends(get_db)],
+    storage: StorageClientDep,
+    rag: RagIngestServiceDep,
+) -> SeaweedFSUploadService:
+    """依赖注入：上传服务（元数据仓储 + 用户仓储 + 对象存储客户端 + RAG 入库服务）。"""
+    return SeaweedFSUploadService(ResourceRepository(db), UserRepository(db), storage, rag)
 
 
 UploadServiceDep = Annotated[SeaweedFSUploadService, Depends(get_upload_service)]

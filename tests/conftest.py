@@ -15,6 +15,9 @@ os.environ["LOG_ACCESS"] = "true"
 os.environ["STORAGE_ROOT"] = str(Path(gettempdir()) / "user-api-test-storage")
 # 启动预热会连真实数据库 / Redis，测试里关掉（用例需要时直接调用 warm_cache()）
 os.environ["PROMPT_CACHE_WARMUP"] = "false"
+# 上传后自动向量化入库默认关闭，避免用例连 DashScope / Qdrant；
+# 需要验证上传触发 RAG 的用例用 dependency_overrides 注入假实现
+os.environ["RAG_INGEST_ENABLED"] = "false"
 # JWT 密钥只走环境变量（生产即如此），测试用独立的固定值，长度满足最小要求
 os.environ["JWT_SECRET_KEY"] = "pytest-only-jwt-secret-key-0123456789abcdef"
 

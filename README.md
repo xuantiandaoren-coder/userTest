@@ -77,8 +77,11 @@
 │   │   ├── stream_chat_service.py  # 流式聊天：模板 + 变量 + 记忆 + 模型链路 -> SSE
 │   │   ├── upload_service.py   #   旧本地落盘实现（教学保留，运行链路不经过）
 │   │   ├── upload_service_seaweedfs.py  # 运行链路：SeaweedFS 存原文件 + MySQL 存元数据
+│   │   ├── rag_service.py      #   上传后 RAG 向量化入库（best-effort，失败不影响上传）
 │   │   ├── resource_cleanup.py #   每天 03:00 清理过期资源（先删对象，再删元数据）
 │   │   └── user_service.py     #   业务逻辑 + 密码哈希
+│   ├── rag                     # RAG 入库实现
+│   │   └── core.py             #   解析 -> 清洗 -> 分类 -> 分块 -> 向量化 -> 写 Qdrant
 │   └── db                      # 数据库层
 │       ├── base.py             #   SQLAlchemy 声明式基类（含约束命名规范）
 │       ├── chat_message_repository.py  # 消息表数据访问（分页 / 附件段解析）
@@ -123,11 +126,13 @@
 
 原文件放 SeaweedFS，本表只存元数据，两者解耦；`UNIQUE(file_hash, user_id)` 是用户级去重的核心。
 模型定义见 `app/db/models.py` 的 `Resource`，迁移脚本 `alembic/versions/20260915_0004_create_resources.py`。
+`doc_category` 列由 `alembic/versions/20260930_0007_add_resource_doc_category.py` 追加。
 
 | 列名 | 类型 | 说明 |
 | --- | --- | --- |
 | `id` | `BIGINT` | 主键、自增 |
 | `resource_type` | `TINYINT` | 0=文件，1=图片，2=音频 |
+| `doc_category` | `VARCHAR(32)` | 文档分类 `resume` / `study_material` / `general`，可空；**仅文件类型（`resource_type=0`）有意义**，图片 / 音频恒为 NULL |
 | `storage_scene` | `TINYINT` | 0=长过期（1 个月），1=短过期（2 小时），2=只提取内容不存原文件 |
 | `upload_purpose` | `TINYINT` | 0=普通资源，1=用户头像 |
 | `file_name` | `VARCHAR(255)` | 用户上传的原始文件名（只取 basename） |
@@ -336,6 +341,9 @@ APP_ENV=prod uv run uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `SEAWEEDFS_PRESIGN_EXPIRE_SECONDS` | 开启鉴权时预签名 URL 的有效期（秒） | `3600` | 同左 |
 | `RESOURCE_TTL_LONG_SECONDS` | `storage_scene=0` 资源过期时间 | `2592000`（1 个月） | 同左 |
 | `RESOURCE_TTL_SHORT_SECONDS` | `storage_scene=1` 资源过期时间 | `7200`（2 小时） | 同左 |
+| `DASHSCOPE_API_KEY` | RAG 文本向量化 Key（敏感，`SecretStr`），缺失时上传仍成功但跳过入库 | 空 | 密钥管理服务注入 |
+| `QDRANT_HOST` / `QDRANT_PORT` | 向量库地址（collection `knowledge_chunks` 不存在时自动创建） | `127.0.0.1` / `6333` | 指向内网向量库 |
+| `RAG_INGEST_ENABLED` | 上传文件后是否自动向量化入库 | `true` | `true`（不需要时置 `false`） |
 | `RESOURCE_CLEANUP_HOUR` / `RESOURCE_CLEANUP_MINUTE` | 过期清理触发时刻 | `3` / `0`（每天 03:00） | 同左 |
 | `REGISTER_RATE_LIMIT` / `REGISTER_RATE_WINDOW` | 注册接口限流配额（次数 / 窗口秒数，按 IP） | `5` / `60` | `5` / `60` |
 | `LOGIN_RATE_LIMIT` / `LOGIN_RATE_WINDOW` | 登录接口限流配额（防口令爆破） | `10` / `60` | `10` / `60` |
@@ -575,6 +583,7 @@ def list_orders(current_user: CurrentUserDep) -> list[Order]:
 | `file` | 文件 | 待上传文件 |
 | `storage_scene` | `0`（默认）/ `1` / `2` | 0=长过期（1 个月）、1=短过期（2 小时）、2=只提取内容不存原文件 |
 | `upload_purpose` | `0`（默认）/ `1` | 0=普通资源、1=用户头像（仅图片类型会更新 `user.avatar`） |
+| `doc_category` | 可空 / `resume` / `study_material` / `general` | 文档分类，**仅文件类型有意义**；不传或传空串按未分类处理，图片 / 音频即使传了也忽略（落 NULL） |
 
 服务端**按内容自动判断类型**，不轻信客户端声明：
 
@@ -593,6 +602,14 @@ def list_orders(current_user: CurrentUserDep) -> list[Order]:
 - 对象键：`<user_id>/<内容 MD5>.<扩展名>`，如 `1/9f86d081...c0a.png`（`resources.storage_path` 存的就是它）
 - 去重：`UNIQUE(file_hash, user_id)`，即**用户级去重**。代码先按 `(MD5, user_id)` 预查，
   命中直接复用（响应 `deduplicated: true`）；并发写入由唯一索引兜底，冲突后回查先写入的那条
+- 文档分类：`doc_category` 只对文件类型生效，取值 `resume` / `study_material` / `general`；
+  非法值返回 `422 INVALID_DOC_CATEGORY`。去重命中时，本次**显式带上的分类会覆盖旧值**，
+  没带（空）则保留原值
+- RAG 入库：**文件类型**落库成功后自动调用 `app/rag/core.py` 的 `ingest_file`
+  （解析 -> 清洗 -> 分类 -> 分块 -> DashScope 向量化 -> 写 Qdrant），
+  `doc_category` 原样透传，为空时由 RAG 侧按关键字自动分类；结果通过
+  `rag_ingested` / `rag_chunk_count` / `rag_error` 回给前端。
+  图片 / 音频、`storage_scene=2`、去重命中的重复上传都不入库
 - `storage_scene=2`：只读内容、不传对象、不写元数据，`extracted_text` 直接返回提取到的文本
 - 过期时间：`storage_scene=0` 为 1 个月，`=1` 为 2 小时，写入 `resources.expire_time`
 - 安全：只取上传文件名的 basename，防目录穿越；扩展名做字符白名单
@@ -609,7 +626,14 @@ curl -X POST http://127.0.0.1:8000/files/upload \
   -F "file=@./avatar.png" -F "upload_purpose=1"
 # 201 {"kind":"image","resource_type":1,"md5":"9f86...c0a","size":20480,"filename":"avatar.png",
 #      "path":"1/9f86...c0a.png","avatar_updated":true,"deduplicated":false,
-#      "storage_scene":0,"upload_purpose":1,"extracted_text":null}
+#      "storage_scene":0,"upload_purpose":1,"doc_category":null,"extracted_text":null}
+
+# 上传文档并带分类（仅文件类型有效；不传即未分类）
+curl -X POST http://127.0.0.1:8000/files/upload \
+  -H "Authorization: Bearer $TOKEN" \
+  -F "file=@./resume.pdf" -F "doc_category=resume"
+# 201 {"kind":"document","resource_type":0,...,"doc_category":"resume",
+#      "rag_ingested":true,"rag_chunk_count":12,"rag_error":null}
 
 # 只提取内容（不存原文件、不写元数据）
 curl -X POST http://127.0.0.1:8000/upload/file \
@@ -629,6 +653,11 @@ curl -X POST http://127.0.0.1:8000/upload/file \
 | 415 | `UNSUPPORTED_FILE_TYPE` | 类型不在图片 / 文档 / 音频白名单，或声明是图片但内容对不上 |
 | 400 | `EMPTY_FILE` | 上传内容为空 |
 | 422 | `UNPROCESSABLE_ENTITY` | `storage_scene` / `upload_purpose` 不在取值范围内 |
+| 422 | `INVALID_DOC_CATEGORY` | `doc_category` 不是 `resume` / `study_material` / `general`（空串按未分类处理，不算错） |
+
+> RAG 入库是**增强能力**：没配 `DASHSCOPE_API_KEY`、Qdrant 不可用、文件类型 RAG 不支持（只支持
+> `pdf` / `docx` / `txt`）时，上传接口依然 `201`，原因放在 `rag_error`
+> （`RAG_DISABLED` / `RAG_UNAVAILABLE` / `RAG_NOT_CONFIGURED` / `UNSUPPORTED_FILE_TYPE` / `RAG_INGEST_FAILED`）。
 
 > 依赖：文件上传需 `python-multipart==0.0.9`，对象存储用 `boto3`（均已在 `pyproject.toml` 固定，`uv sync` 自动安装）。
 

@@ -152,6 +152,15 @@ class Settings(BaseSettings):
     # 启动时预热模板缓存：后台线程执行，不阻塞启动；测试环境置 false，避免连真实数据库
     prompt_cache_warmup: bool = True
 
+    # ------------------------------------------------------------------
+    # RAG：DashScope 文本向量化 + Qdrant 向量库（见 app/rag/core.py）
+    # ------------------------------------------------------------------
+    dashscope_api_key: SecretStr = Field(default=SecretStr(""), description="DashScope API Key（敏感）")
+    qdrant_host: str = "127.0.0.1"   # Qdrant 服务地址
+    qdrant_port: int = 6333          # Qdrant HTTP 端口
+    # 上传文件后自动向量化入库；失败只记日志、不影响上传结果（向量化是增强能力）
+    rag_ingest_enabled: bool = True
+
     # 生产默认关闭接口文档，避免暴露内部接口清单
     docs_enabled: bool = Field(default_factory=lambda: current_env() is Env.DEV)
 

@@ -20,4 +20,17 @@ class UploadResult(BaseModel):
     deduplicated: bool = Field(description="命中该用户已有资源（内容相同），未重复上传")
     storage_scene: int = Field(default=0, description="存储场景：0=长过期，1=短过期，2=只提取内容")
     upload_purpose: int = Field(default=0, description="上传用途：0=普通资源，1=用户头像")
+    doc_category: str | None = Field(
+        default=None,
+        description="文档分类：resume/study_material/general；仅文件类型有意义，其余为 null",
+    )
+    rag_ingested: bool = Field(
+        default=False,
+        description="该文件是否已向量化入知识库（仅文件类型会尝试；失败不影响上传成功）",
+    )
+    rag_chunk_count: int = Field(default=0, description="入知识库时切分出的分块数；未入库为 0")
+    rag_error: str | None = Field(
+        default=None,
+        description="未入库原因 / 错误码，如 RAG_DISABLED / RAG_NOT_CONFIGURED / UNSUPPORTED_FILE_TYPE；入库成功或未尝试为 null",
+    )
     extracted_text: str | None = Field(default=None, description="storage_scene=2 时提取到的文件内容")
