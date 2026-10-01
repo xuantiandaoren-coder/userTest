@@ -4,6 +4,7 @@
 
 配置统一走 ``app.core.config.settings``：
 - ``dashscope_api_key``：DashScope 文本向量化 Key
+- ``embedding_model`` / ``embedding_dim`` / ``embedding_batch_size``：向量化模型与批大小
 - ``qdrant_host`` / ``qdrant_port``：Qdrant 服务地址
 """
 
@@ -35,9 +36,6 @@ __all__ = ["ingest_file"]
 # 常量
 # ---------------------------------------------------------------------------
 COLLECTION_NAME = "knowledge_chunks"
-EMBEDDING_MODEL = "text_embedding-v4"
-EMBEDDING_DIM = 1024
-EMBEDDING_BATCH_SIZE = 10
 
 CHUNK_SIZE = 500
 CHUNK_OVERLAP = 50
@@ -81,7 +79,7 @@ class RagNotConfiguredError(SystemError):
 
 
 class EmbeddingError(SystemError):
-    """系统异常：DashScope 向量化调用失败。"""
+    """系统异常：向量化调用失败。"""
 
     code = "EMBEDDING_FAILED"
     message = "文本向量化失败，请稍后重试"
@@ -207,7 +205,7 @@ def _chunk(text: str) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# 向量化：DashScope text_embedding-v4，维度 1024，每批 10 条，按 text_index 对齐
+# 向量化：DashScope qwen3.7-text-embedding，维度 / 批大小走配置，按 text_index 对齐
 # ---------------------------------------------------------------------------
 def _embed(texts: list[str]) -> list[list[float]]:
     if not texts:
@@ -219,18 +217,19 @@ def _embed(texts: list[str]) -> list[list[float]]:
             detail="缺少 dashscope_api_key，请在 .env / 环境变量中配置 DASHSCOPE_API_KEY",
         )
 
+    batch_size = max(1, settings.embedding_batch_size)
     vectors: list[list[float]] = []
-    for offset in range(0, len(texts), EMBEDDING_BATCH_SIZE):
-        batch = texts[offset : offset + EMBEDDING_BATCH_SIZE]
+    for offset in range(0, len(texts), batch_size):
+        batch = texts[offset : offset + batch_size]
         response = TextEmbedding.call(
-            model=EMBEDDING_MODEL,
+            model=settings.embedding_model,
             input=batch,
-            dimension=EMBEDDING_DIM,
+            dimension=settings.embedding_dim,
             api_key=api_key,
         )
         if getattr(response, "status_code", None) != 200:
             raise EmbeddingError(
-                detail=f"DashScope 返回异常：code={getattr(response, 'code', None)} message={getattr(response, 'message', None)}",
+                detail=f"向量化服务返回异常：code={getattr(response, 'code', None)} message={getattr(response, 'message', None)}",
             )
 
         embeddings = response.output["embeddings"]
@@ -253,9 +252,9 @@ def _ensure_collection(client: QdrantClient) -> None:
     if COLLECTION_NAME not in existing:
         client.create_collection(
             collection_name=COLLECTION_NAME,
-            vectors_config=VectorParams(size=EMBEDDING_DIM, distance=Distance.COSINE),
+            vectors_config=VectorParams(size=settings.embedding_dim, distance=Distance.COSINE),
         )
-        logger.info("创建 Qdrant collection=%s dim=%s", COLLECTION_NAME, EMBEDDING_DIM)
+        logger.info("创建 Qdrant collection=%s dim=%s", COLLECTION_NAME, settings.embedding_dim)
 
 
 def _write_qdrant(

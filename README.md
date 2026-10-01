@@ -342,6 +342,7 @@ APP_ENV=prod uv run uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `RESOURCE_TTL_LONG_SECONDS` | `storage_scene=0` 资源过期时间 | `2592000`（1 个月） | 同左 |
 | `RESOURCE_TTL_SHORT_SECONDS` | `storage_scene=1` 资源过期时间 | `7200`（2 小时） | 同左 |
 | `DASHSCOPE_API_KEY` | RAG 文本向量化 Key（敏感，`SecretStr`），缺失时上传仍成功但跳过入库 | 空 | 密钥管理服务注入 |
+| `EMBEDDING_MODEL` / `EMBEDDING_DIM` / `EMBEDDING_BATCH_SIZE` | 向量化模型 / 维度 / 单批条数（DashScope 单次上限 25） | `qwen3.7-text-embedding` / `1024` / `10` | 换模型时 `EMBEDDING_DIM` 必须与 Qdrant 建库维度一致 |
 | `QDRANT_HOST` / `QDRANT_PORT` | 向量库地址（collection `knowledge_chunks` 不存在时自动创建） | `127.0.0.1` / `6333` | 指向内网向量库 |
 | `RAG_INGEST_ENABLED` | 上传文件后是否自动向量化入库 | `true` | `true`（不需要时置 `false`） |
 | `RESOURCE_CLEANUP_HOUR` / `RESOURCE_CLEANUP_MINUTE` | 过期清理触发时刻 | `3` / `0`（每天 03:00） | 同左 |
@@ -606,7 +607,7 @@ def list_orders(current_user: CurrentUserDep) -> list[Order]:
   非法值返回 `422 INVALID_DOC_CATEGORY`。去重命中时，本次**显式带上的分类会覆盖旧值**，
   没带（空）则保留原值
 - RAG 入库：**文件类型**落库成功后自动调用 `app/rag/core.py` 的 `ingest_file`
-  （解析 -> 清洗 -> 分类 -> 分块 -> DashScope 向量化 -> 写 Qdrant），
+  （解析 -> 清洗 -> 分类 -> 分块 -> DashScope qwen3.7-text-embedding 向量化 -> 写 Qdrant），
   `doc_category` 原样透传，为空时由 RAG 侧按关键字自动分类；结果通过
   `rag_ingested` / `rag_chunk_count` / `rag_error` 回给前端。
   图片 / 音频、`storage_scene=2`、去重命中的重复上传都不入库

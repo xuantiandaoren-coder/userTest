@@ -153,9 +153,15 @@ class Settings(BaseSettings):
     prompt_cache_warmup: bool = True
 
     # ------------------------------------------------------------------
-    # RAG：DashScope 文本向量化 + Qdrant 向量库（见 app/rag/core.py）
+    # RAG：文本向量化（DashScope）+ Qdrant 向量库（见 app/rag/core.py）
     # ------------------------------------------------------------------
     dashscope_api_key: SecretStr = Field(default=SecretStr(""), description="DashScope API Key（敏感）")
+    # 向量化模型：qwen3.7-text-embedding 走 DashScope，维度 1024
+    embedding_model: str = "qwen3.7-text-embedding"
+    # 向量维度：必须与 Qdrant collection 建库维度一致，换模型时同步改
+    embedding_dim: int = 1024
+    # 单次向量化请求的文本条数（DashScope 单次上限 25）
+    embedding_batch_size: int = 10
     qdrant_host: str = "127.0.0.1"   # Qdrant 服务地址
     qdrant_port: int = 6333          # Qdrant HTTP 端口
     # 上传文件后自动向量化入库；失败只记日志、不影响上传结果（向量化是增强能力）
