@@ -72,12 +72,15 @@ class StreamPlan:
     agent_name: str
     scene: str
     system_prompt: str
-    question: str
+    question: str                                   # 原始提问：落库 / 历史 / 前端展示
+    prompt_question: str = ""                       # 注入参考资料后的问题：只进本轮提示词
     history: list[BaseMessage] = field(default_factory=list)
     model: BaseChatModel | None = None
     select_model: int = 0
     prompt_versions: str = ""
     search_hits: list[dict[str, Any]] = field(default_factory=list)
+    sources: list[dict[str, Any]] = field(default_factory=list)       # 知识库来源（SSE done 下发）
+    references: list[dict[str, Any]] = field(default_factory=list)    # 落库引用：只有 chunk_id + score
     warnings: list[str] = field(default_factory=list)
 
 
@@ -139,20 +142,71 @@ class StreamChatService:
         )
         rendered = build_system_prompt(composed, variables, memory=memory)
 
+        # RAG：按需检索自己的知识库 -> 参考资料拼到本轮问题前 -> system 只补 RAG 回答规则
+        system_prompt, prompt_question, sources, references = self._apply_rag(
+            user_id=user.id,
+            system_prompt=rendered.text,
+            question=payload.message,
+        )
+
         return StreamPlan(
             request_id=uuid.uuid4().hex,
             user_id=user.id,
             session_id=session_id,
             agent_name=agent_name,
             scene=agent.scene,
-            system_prompt=rendered.text,
-            question=payload.message,
+            system_prompt=system_prompt,
+            question=payload.message,     # 原始提问落库 / 进历史，注入的参考资料不落库
+            prompt_question=prompt_question,
             history=memory.messages,
             model=self._resolve_model(agent),
             select_model=agent.select_model if agent.select_model is not None else 0,
             prompt_versions=composed.version_label,
             search_hits=[hit.as_dict() for hit in memory.search_hits],
+            sources=sources,
+            references=references,
             warnings=[*rendered.warnings, *memory.warnings],
+        )
+
+    def _apply_rag(
+        self,
+        *,
+        user_id: int,
+        system_prompt: str,
+        question: str,
+    ) -> tuple[str, str, list[dict[str, Any]], list[dict[str, Any]]]:
+        """按需检索知识库并注入本轮，返回 (system_prompt, question, sources, references)。
+
+        意图判断不过（空输入 / 极短 / 确认语 / 礼貌语 / 推进语）就不检索；
+        检索属于增强能力，依赖缺失或检索失败都只记日志，本轮按无资料回答。
+        注意落库与历史用的仍是**原始问题**，注入的参考资料只进本轮提示词。
+        """
+        try:
+            # 延迟导入：向量库 / 向量化依赖较重，缺失时只影响检索，不影响聊天
+            from app.rag.dialogue import (
+                RAG_TOP_K,
+                build_rag_system_prompt,
+                compose_question,
+                retrieve_knowledge,
+            )
+        except ImportError as exc:
+            logger.warning("RAG 依赖不可用，跳过知识库检索：%r", exc)
+            return system_prompt, question, [], []
+
+        try:
+            rag = retrieve_knowledge(question, user_id=user_id, db=self.messages.session, top_k=RAG_TOP_K)
+        except Exception as exc:  # noqa: BLE001 - 检索是增强项，失败不能让聊天整体不可用
+            logger.warning("知识库检索异常，本轮不注入资料：%r", exc)
+            return system_prompt, question, [], []
+
+        if not rag.has_context:
+            return system_prompt, question, rag.sources, rag.references
+        logger.info("知识库注入 user_id=%s chunks=%s", user_id, len(rag.chunks))
+        return (
+            build_rag_system_prompt(system_prompt),
+            compose_question(rag.retrieved_text, question),
+            rag.sources,
+            rag.references,
         )
 
     def _resolve_model(self, agent: AgentSetting) -> BaseChatModel:
@@ -181,7 +235,12 @@ class StreamChatService:
             },
         )
 
-        context = PromptContext(system=plan.system_prompt, question=plan.question, history=plan.history)
+        # 进模型的是注入了参考资料的问题；plan.question 保持原始提问，落库与历史都用它
+        context = PromptContext(
+            system=plan.system_prompt,
+            question=plan.prompt_question or plan.question,
+            history=plan.history,
+        )
         chain = self.chain or build_chain(plan.model or self.model)
         buffer: list[str] = []
         try:
@@ -208,6 +267,7 @@ class StreamChatService:
                 "answer_length": len(answer),
                 "prompt_versions": plan.prompt_versions,
                 "search_hits": len(plan.search_hits),
+                "sources": plan.sources,   # 本轮回答引用的知识片段（含原文，供前端展示来源）
                 "elapsed_ms": int((time.monotonic() - started) * 1000),
             },
         )
@@ -239,6 +299,8 @@ class StreamChatService:
                 request_id=plan.request_id,
                 request_text=plan.question,
                 response_text=answer,
+                # 只存引用（chunk_id + score），知识块全文仍只在 knowledge_chunks 里存一份
+                reference_sources=plan.references or None,
             )
             session.commit()
             return message.id

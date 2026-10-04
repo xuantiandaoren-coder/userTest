@@ -47,6 +47,7 @@ class ChatMessageRepository:
         request_segments: list[dict[str, Any]] | None = None,
         response_segments: list[dict[str, Any]] | None = None,
         file_extracted_text: str | None = None,
+        reference_sources: list[dict[str, Any]] | None = None,
     ) -> ChatMessage:
         """写入一轮问答（流式聊天在流结束后调用），flush + refresh 拿到自增 id。"""
         message = ChatMessage(
@@ -59,6 +60,7 @@ class ChatMessageRepository:
             request_segments=request_segments,
             response_segments=response_segments,
             file_extracted_text=file_extracted_text,
+            reference_sources=reference_sources,
         )
         self.session.add(message)
         self.session.flush()

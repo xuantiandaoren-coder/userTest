@@ -38,8 +38,19 @@ class FakeRagIngestService:
         file_name: str,
         user_id: int,
         doc_category: str | None = None,
+        db: object | None = None,
+        resource_id: int | None = None,
     ) -> RagIngestResult:
-        self.calls.append({"data": data, "file_name": file_name, "user_id": user_id, "doc_category": doc_category})
+        self.calls.append(
+            {
+                "data": data,
+                "file_name": file_name,
+                "user_id": user_id,
+                "doc_category": doc_category,
+                "db": db,
+                "resource_id": resource_id,
+            }
+        )
         return self.result
 
 
@@ -101,6 +112,10 @@ async def test_document_upload_ingests_into_rag_with_doc_category(
     assert call["doc_category"] == "resume"  # 前端传的文件类型一路透传到 RAG
     assert call["data"] == TXT_BYTES  # 直接复用上传时读到的字节，不重复读文件
     assert call["user_id"] == _user_id(db_session, "ragdoc")
+    # 会话与资源主键一起传给 RAG：分块原文要关联到这次落库的 resources 行
+    assert call["db"] is db_session
+    resource_id = body["resource_id"]
+    assert call["resource_id"] == resource_id
 
 
 @pytest.mark.anyio
@@ -244,14 +259,26 @@ async def test_rag_service_maps_ingest_summary(monkeypatch: pytest.MonkeyPatch) 
         *,
         user_id: int,
         doc_category: str | None = None,
+        db: object | None = None,
+        resource_id: int | None = None,
     ) -> dict[str, object]:
-        seen.update({"source": source, "file_name": file_name, "user_id": user_id, "doc_category": doc_category})
+        seen.update(
+            {
+                "source": source,
+                "file_name": file_name,
+                "user_id": user_id,
+                "doc_category": doc_category,
+                "db": db,
+                "resource_id": resource_id,
+            }
+        )
         return {
             "file_name": file_name,
             "user_id": user_id,
             "doc_category": "study_material",
             "chunk_count": 5,
             "point_ids": [],
+            "stored_chunks": 5,
         }
 
     monkeypatch.setattr(app_rag, "ingest_file", fake_ingest_file)
@@ -265,6 +292,8 @@ async def test_rag_service_maps_ingest_summary(monkeypatch: pytest.MonkeyPatch) 
         "file_name": "course.txt",
         "user_id": 7,
         "doc_category": "study_material",
+        "db": None,
+        "resource_id": None,
     }
     assert result == RagIngestResult(ingested=True, doc_category="study_material", chunk_count=5)
 
@@ -281,6 +310,8 @@ async def test_rag_service_swallows_rag_errors(monkeypatch: pytest.MonkeyPatch) 
         *,
         user_id: int,
         doc_category: str | None = None,
+        db: object | None = None,
+        resource_id: int | None = None,
     ) -> dict[str, object]:
         raise RagNotConfiguredError(detail="missing dashscope_api_key")
 
@@ -302,6 +333,8 @@ async def test_rag_service_swallows_unexpected_errors(monkeypatch: pytest.Monkey
         *,
         user_id: int,
         doc_category: str | None = None,
+        db: object | None = None,
+        resource_id: int | None = None,
     ) -> dict[str, object]:
         raise RuntimeError("qdrant exploded")
 

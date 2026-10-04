@@ -1,11 +1,24 @@
 """RAG 文件向量化入库：解析 -> 清洗 -> 分类 -> 分块 -> 向量化 -> 写 Qdrant。
 
 对外只暴露 ``ingest_file``，其余函数均为模块内私有实现（单文件聚合，不过度抽象）。
+PDF 解析用 pypdfium2 抽文本层，抽不出内容（平均每页字符数过低，典型是扫描件）时
+转 ``app.rag.ocr.ocr_pdf`` 走 OCR 兜底；OCR 实现单独放在 app/rag/ocr.py。
 
 配置统一走 ``app.core.config.settings``：
 - ``dashscope_api_key``：DashScope 文本向量化 Key
 - ``embedding_model`` / ``embedding_dim`` / ``embedding_batch_size``：向量化模型与批大小
+- ``ocr_enabled`` / ``pdf_scanned_min_chars_per_page``：扫描件判定与 OCR 兜底开关
 - ``qdrant_host`` / ``qdrant_port``：Qdrant 服务地址
+
+分块用 langchain 的 ``RecursiveCharacterTextSplitter`` 递归切片：优先在 Markdown 标题
+（DOCX 的 Heading 1/2/3 会注入 ``#`` / ``##`` / ``###``）断开，其次按段落、换行、
+中文句读、空格，最后退到字符级；切片结果仍按 MD5 去重。
+
+分块数据分开存：Qdrant 只存**向量 + 检索过滤字段**（user_id / doc_category / file_name /
+chunk_index），原文写 MySQL 的 knowledge_chunks（app/rag/chunk_store.py），
+两边用入库时生成的同一个 UUID 关联（Qdrant point id == vector_id）。
+写库是**覆盖**语义：先按（user_id, file_name）删掉旧分块再写新分块，
+同一个用户重复上传同名文件（内容变了）不会出现新旧点并存、检索到重复片段的情况。
 """
 
 from __future__ import annotations
@@ -18,19 +31,30 @@ import uuid
 from collections.abc import Callable
 from pathlib import Path
 
-import PyPDF2
+import pypdfium2 as pdfium
 from dashscope import TextEmbedding
 from docx import Document
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, PointStruct, VectorParams
+from qdrant_client.models import (
+    Distance,
+    FieldCondition,
+    Filter,
+    MatchValue,
+    PointStruct,
+    VectorParams,
+)
+from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.core.exceptions import SystemError
 from app.core.storage import UnsupportedFileTypeError
+from app.rag.chunk_store import save_chunks
+from app.rag.ocr import ocr_pdf
 
 logger = logging.getLogger("app.rag")
 
-__all__ = ["ingest_file"]
+__all__ = ["ingest_file", "embed_texts"]
 
 # ---------------------------------------------------------------------------
 # 常量
@@ -45,8 +69,18 @@ CATEGORY_STUDY = "study_material"
 CATEGORY_GENERAL = "general"
 VALID_CATEGORIES = frozenset({CATEGORY_RESUME, CATEGORY_STUDY, CATEGORY_GENERAL})
 
-# 分块回退切分点（在窗口内优先按这些字符断开，避免切开句子）
-SENTENCE_TERMINATORS = "。！？\n"
+# Word 标题样式 -> Markdown 标题标记（中文版 Word 的样式名是 "标题 1"，一并映射）
+DOCX_HEADING_PREFIXES = {
+    "Heading 1": "#",
+    "Heading 2": "##",
+    "Heading 3": "###",
+    "标题 1": "#",
+    "标题 2": "##",
+    "标题 3": "###",
+}
+
+# 递归切片的分隔符优先级（从粗到细）：标题 -> 段落 -> 换行 -> 中文句读 -> 空格 -> 字符兜底
+CHUNK_SEPARATORS = ["\n###", "\n##", "\n#", "\n\n", "\n", "。", "！", "？", "；", "，", " ", ""]
 
 # 分类关键字：命中即计分（大小写不敏感）
 _RESUME_KEYWORDS = (
@@ -96,13 +130,60 @@ class VectorStoreError(SystemError):
 # 解析：按扩展名字典分派
 # ---------------------------------------------------------------------------
 def _parse_pdf(data: bytes) -> str:
-    reader = PyPDF2.PdfReader(io.BytesIO(data))
-    return "\n".join(page.extract_text() or "" for page in reader.pages)
+    """PDF -> 文本；抽不出文本层（扫描件）时走 OCR 兜底。
+
+    判定口径：pypdfium2 抽出全文后算“平均每页字符数”，低于
+    ``settings.pdf_scanned_min_chars_per_page``（默认 20）即视为扫描件——
+    这类 PDF 的文字只存在于图片里，文本层要么为空、要么只有零散水印字符。
+    """
+    text, page_count = _extract_pdf_text(data)
+    if not page_count or not settings.ocr_enabled:
+        return text
+    if len(text) / page_count >= settings.pdf_scanned_min_chars_per_page:
+        return text
+
+    logger.info(
+        "PDF 判定为扫描件 pages=%s text_chars=%s，转 OCR 兜底",
+        page_count,
+        len(text),
+    )
+    return ocr_pdf(data)
+
+
+def _extract_pdf_text(data: bytes) -> tuple[str, int]:
+    """pypdfium2 逐页抽文本层，返回（全文, 页数）。"""
+    pages: list[str] = []
+    with pdfium.PdfDocument(data) as document:
+        for index in range(len(document)):
+            page = document[index]
+            try:
+                textpage = page.get_textpage()
+                try:
+                    pages.append(textpage.get_text_range())
+                finally:
+                    textpage.close()
+            finally:
+                page.close()
+    return "\n".join(pages), len(pages)
 
 
 def _parse_docx(data: bytes) -> str:
+    """DOCX -> 文本；Heading 1/2/3 段落注入 # / ## / ### 标题标记。
+
+    注入的标记会被切片按 ``\n###`` / ``\n##`` / ``\n#`` 优先识别，标题连同其正文
+    更容易落在同一块里；非标题段落保持原样，空段落保留（段落边界对切片有用）。
+    """
     document = Document(io.BytesIO(data))
-    return "\n".join(paragraph.text for paragraph in document.paragraphs)
+    lines: list[str] = []
+    for paragraph in document.paragraphs:
+        text = paragraph.text.strip()
+        if not text:
+            lines.append("")
+            continue
+        style_name = (getattr(paragraph.style, "name", "") or "").strip()
+        prefix = DOCX_HEADING_PREFIXES.get(style_name, "")
+        lines.append(f"{prefix} {text}" if prefix else text)
+    return "\n".join(lines)
 
 
 def _parse_txt(data: bytes) -> str:
@@ -164,42 +245,32 @@ def _classify(text: str, doc_category: str | None) -> str:
 
 
 # ---------------------------------------------------------------------------
-# 分块：滑动窗口 size=500 overlap=50，回退句子终止切分，MD5 去重
+# 分块：递归切片 size=500 overlap=50（标题 -> 段落 -> 句读 -> 字符兜底），MD5 去重
 # ---------------------------------------------------------------------------
-def _last_terminator(text: str, start: int, end: int) -> int:
-    """在 [start, end) 内找最后一个句子终止符，返回断点（终止符之后）；找不到返回 end。"""
-    for position in range(end - 1, start, -1):
-        if text[position] in SENTENCE_TERMINATORS:
-            return position + 1
-    return end
-
-
 def _chunk(text: str) -> list[str]:
+    """递归智能切片：按分隔符优先级从粗到细找断点，尽量不切开标题与句子。"""
     text = text.strip()
     if not text:
         return []
 
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=CHUNK_SIZE,
+        chunk_overlap=CHUNK_OVERLAP,
+        separators=CHUNK_SEPARATORS,
+        # 分隔符跟在下段开头：标点不丢，DOCX 注入的 "### 标题" 也不会和标题分家
+        keep_separator=True,
+    )
+
     chunks: list[str] = []
     seen: set[str] = set()  # MD5 去重
-    length = len(text)
-    start = 0
-
-    while start < length:
-        end = min(start + CHUNK_SIZE, length)
-        if end < length:
-            # 窗口尾部回退到最近的句子终止符，避免把句子切断
-            end = _last_terminator(text, start, end)
-
-        piece = text[start:end].strip()
-        if piece:
-            digest = hashlib.md5(piece.encode("utf-8"), usedforsecurity=False).hexdigest()
-            if digest not in seen:
-                seen.add(digest)
-                chunks.append(piece)
-
-        if end >= length:
-            break
-        start = max(end - CHUNK_OVERLAP, start + 1)  # 保证前进，不会死循环
+    for piece in splitter.split_text(text):
+        piece = piece.strip()
+        if not piece:
+            continue
+        digest = hashlib.md5(piece.encode("utf-8"), usedforsecurity=False).hexdigest()
+        if digest not in seen:
+            seen.add(digest)
+            chunks.append(piece)
 
     return chunks
 
@@ -207,7 +278,12 @@ def _chunk(text: str) -> list[str]:
 # ---------------------------------------------------------------------------
 # 向量化：DashScope qwen3.7-text-embedding，维度 / 批大小走配置，按 text_index 对齐
 # ---------------------------------------------------------------------------
-def _embed(texts: list[str]) -> list[list[float]]:
+def embed_texts(texts: list[str]) -> list[list[float]]:
+    """把文本向量化（返回顺序与入参一致）；入库与检索共用这一条链路。
+
+    检索侧只需要 ``embed_texts([query])[0]``，因此这里不做单条特判，
+    维度、批量大小、异常类型（RAG_NOT_CONFIGURED / EMBEDDING_FAILED）两边保持一致。
+    """
     if not texts:
         return []
 
@@ -257,28 +333,61 @@ def _ensure_collection(client: QdrantClient) -> None:
         logger.info("创建 Qdrant collection=%s dim=%s", COLLECTION_NAME, settings.embedding_dim)
 
 
+def _delete_existing_points(client: QdrantClient, *, user_id: int, file_name: str) -> int:
+    """删除同一（user_id, file_name）的旧分块，返回删除条数。
+
+    覆盖语义：同一个用户重复上传同名文件时，旧内容的分块必须先清掉，否则新旧点并存，
+    检索会把过期片段和新片段一起召回（同一份资料的重复答案）。
+    """
+    selector = Filter(
+        must=[
+            FieldCondition(key="user_id", match=MatchValue(value=user_id)),
+            FieldCondition(key="file_name", match=MatchValue(value=file_name)),
+        ]
+    )
+    try:
+        existing = client.count(collection_name=COLLECTION_NAME, count_filter=selector).count
+        if existing:
+            client.delete(collection_name=COLLECTION_NAME, points_selector=selector)
+    except Exception as exc:  # noqa: BLE001 - 统一转系统异常，细节写日志
+        raise VectorStoreError(detail=f"Qdrant 删除同名文件旧分块失败：{exc}") from exc
+    return existing
+
+
 def _write_qdrant(
     *,
-    texts: list[str],
     vectors: list[list[float]],
     user_id: int,
     doc_category: str,
     file_name: str,
 ) -> list[str]:
+    """写向量库：先按（user_id, file_name）删旧点，再写本次的新点；返回新点的 id。
+
+    payload 只放检索过滤字段，**不存原文**（原文在 MySQL 的 knowledge_chunks，
+    两边用这里生成的 point id == vector_id 关联）。
+    """
     client = QdrantClient(host=settings.qdrant_host, port=settings.qdrant_port)
     _ensure_collection(client)
 
+    removed = _delete_existing_points(client, user_id=user_id, file_name=file_name)
+    if removed:
+        logger.info(
+            "覆盖写入：先删除旧分块 file=%s user_id=%s removed=%s",
+            file_name,
+            user_id,
+            removed,
+        )
+
     point_ids: list[str] = []
     points: list[PointStruct] = []
-    for chunk_index, (text, vector) in enumerate(zip(texts, vectors, strict=True)):
-        point_id = str(uuid.uuid4())
+    for chunk_index, vector in enumerate(vectors):
+        point_id = str(uuid.uuid4())  # 同值写进 Qdrant point id 与 MySQL knowledge_chunks.vector_id
         point_ids.append(point_id)
         points.append(
             PointStruct(
                 id=point_id,
                 vector=vector,
                 payload={
-                    "text": text,
                     "user_id": user_id,
                     "doc_category": doc_category,
                     "file_name": file_name,
@@ -313,21 +422,26 @@ def ingest_file(
     *,
     user_id: int,
     doc_category: str | None = None,
+    db: Session | None = None,
+    resource_id: int | None = None,
 ) -> dict[str, object]:
-    """把一个文件向量化并写入 Qdrant，返回入库摘要。
+    """把一个文件向量化入库，返回入库摘要。
 
     入参：
     - ``source``：文件路径（str / Path），或文件字节内容（bytes）
     - ``file_name``：展示名 / 类型识别用；传路径时可省略（默认取路径文件名），传 bytes 时必填
     - ``user_id``：归属用户
     - ``doc_category``：显式分类（resume / study_material / general），传入则优先于关键字计分
+    - ``db`` / ``resource_id``：写分块原文用的会话与资源主键（由上传链路传入）；
+      不传则原文不落库（向量库已不存原文，检索会取不到内容），仅用于离线调试
 
     用法::
 
-        ingest_file("/data/a.pdf", user_id=1)
+        ingest_file("/data/a.pdf", user_id=1, db=session, resource_id=12)
         ingest_file(b"...", "note.txt", user_id=1)
 
-    返回：``{"file_name", "user_id", "doc_category", "chunk_count", "point_ids"}``
+    顺序：写 Qdrant（先删同文件旧点）-> 写 MySQL knowledge_chunks（先删同文件旧分块）。
+    返回：``{"file_name", "user_id", "doc_category", "chunk_count", "point_ids", "stored_chunks"}``
     """
     resolved_name, data = _resolve_source(source, file_name)
 
@@ -336,22 +450,31 @@ def ingest_file(
     chunks = _chunk(text)
 
     point_ids: list[str] = []
+    stored_chunks = 0
     if chunks:
-        vectors = _embed(chunks)
+        vectors = embed_texts(chunks)
         point_ids = _write_qdrant(
-            texts=chunks,
             vectors=vectors,
             user_id=user_id,
             doc_category=category,
             file_name=resolved_name,
         )
+        stored_chunks = _save_chunk_texts(
+            db=db,
+            resource_id=resource_id,
+            user_id=user_id,
+            file_name=resolved_name,
+            texts=chunks,
+            vector_ids=point_ids,
+        )
 
     logger.info(
-        "RAG 入库完成 file=%s category=%s chunks=%s points=%s",
+        "RAG 入库完成 file=%s category=%s chunks=%s points=%s 原文入库=%s",
         resolved_name,
         category,
         len(chunks),
         len(point_ids),
+        stored_chunks,
     )
     return {
         "file_name": resolved_name,
@@ -359,4 +482,32 @@ def ingest_file(
         "doc_category": category,
         "chunk_count": len(chunks),
         "point_ids": point_ids,
+        "stored_chunks": stored_chunks,
     }
+
+
+def _save_chunk_texts(
+    *,
+    db: Session | None,
+    resource_id: int | None,
+    user_id: int,
+    file_name: str,
+    texts: list[str],
+    vector_ids: list[str],
+) -> int:
+    """把分块原文写进 MySQL knowledge_chunks；缺 db / resource_id 时只记日志。"""
+    if db is None or resource_id is None:
+        logger.warning(
+            "未传 db/resource_id，分块原文未落库（向量库只存向量，检索将取不到内容）file=%s chunks=%s",
+            file_name,
+            len(texts),
+        )
+        return 0
+    return save_chunks(
+        db,
+        resource_id=resource_id,
+        user_id=user_id,
+        file_name=file_name,
+        texts=texts,
+        vector_ids=vector_ids,
+    )

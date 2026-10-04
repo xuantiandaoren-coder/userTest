@@ -51,6 +51,7 @@ def test_chat_messages_columns() -> None:
             "request_segments",
             "response_segments",
             "file_extracted_text",
+            "reference_sources",
             "created_at",
         ]
     )
@@ -60,6 +61,7 @@ def test_chat_messages_columns() -> None:
     assert columns.request_segments.nullable is True  # 只存附件段，无附件为空
     assert columns.response_segments.nullable is True
     assert columns.file_extracted_text.nullable is True  # 只有带附件的消息才有提取文本
+    assert columns.reference_sources.nullable is True  # 只存 chunk_id + score，没引用时为空
     assert columns.created_at.server_default is not None
 
 

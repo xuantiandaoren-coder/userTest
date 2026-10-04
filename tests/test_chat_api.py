@@ -173,6 +173,7 @@ async def test_messages_pagination_shape_and_interview_card_fields(
         "response_text",
         "request_segments",
         "response_segments",
+        "sources",  # 知识来源：有引用的消息按 reference_sources 回查拼出，其余为空数组
         "status",
         "interview_id",
         "created_at",

@@ -81,12 +81,16 @@
 │   │   ├── resource_cleanup.py #   每天 03:00 清理过期资源（先删对象，再删元数据）
 │   │   └── user_service.py     #   业务逻辑 + 密码哈希
 │   ├── rag                     # RAG 入库实现
-│   │   └── core.py             #   解析 -> 清洗 -> 分类 -> 分块 -> 向量化 -> 写 Qdrant
+│   │   ├── core.py             #   解析 -> 清洗 -> 分类 -> 分块 -> 向量化 -> 写 Qdrant + 写分块原文
+│   │   ├── chunk_store.py      #   分块原文写 MySQL knowledge_chunks（与 Qdrant 用 UUID 关联）
+│   │   ├── retriever.py        #   检索：问题向量化 -> Qdrant 近邻（按 user_id 过滤）-> 回 MySQL 取原文
+│   │   ├── dialogue.py         #   对话链路：意图判断 -> 资料注入 -> 来源组装与历史回显
+│   │   └── ocr.py              #   扫描件 OCR 兜底：渲染 PNG -> 视觉 OCR 模型 -> 按行拼接
 │   └── db                      # 数据库层
 │       ├── base.py             #   SQLAlchemy 声明式基类（含约束命名规范）
 │       ├── chat_message_repository.py  # 消息表数据访问（分页 / 附件段解析）
 │       ├── interview_repository.py     # 面试表数据访问（id+user 查询）
-│       ├── models.py           #   ORM 模型：用户 / 会话 / 消息 / 面试记录 / 资源元数据
+│       ├── models.py           #   ORM 模型：用户 / 会话 / 消息 / 面试 / 资源 / 知识库分块 / 提示词 / 画像
 │       ├── prompt_template_repository.py  # prompt_templates 表数据访问（分组 / 版本 / 生效切换）
 │       ├── resource_repository.py  # resources 表数据访问（去重预查 / 过期扫描）
 │       ├── session_repository.py   # 会话表数据访问（分页 / 归属过滤）
@@ -148,6 +152,86 @@
 先删 SeaweedFS 对象，成功后再删元数据（删对象失败则保留元数据、次日重试，避免产生无主对象）。
 清理逻辑见 `app/services/resource_cleanup.py`，调度器见 `app/core/scheduler.py`。
 
+## 数据建模（`knowledge_chunks` 知识库分块原文表）
+
+分块数据**分两份存**：向量在 Qdrant，原文在本表，两边用入库时生成的同一个 UUID 关联
+（Qdrant point id == `knowledge_chunks.vector_id`）。
+模型定义见 `app/db/models.py` 的 `KnowledgeChunk`，迁移脚本
+`alembic/versions/20261004_0008_create_knowledge_chunks.py`，写入实现见 `app/rag/chunk_store.py`。
+
+| 列名 | 类型 | 说明 |
+| --- | --- | --- |
+| `id` | `BIGINT` | 主键、自增 |
+| `resource_id` | `BIGINT` | 关联 `resources.id`（外键 `ON DELETE CASCADE`，资源过期被清理时本表跟随删除） |
+| `vector_id` | `VARCHAR(36)` | Qdrant point id（入库时生成的 UUID），唯一索引 `uk_knowledge_chunks_vector_id` |
+| `chunk_index` | `INT` | 文件内分块序号，从 0 开始 |
+| `char_count` | `INT` | 分块字符数 |
+| `text` | `MEDIUMTEXT` | 分块原文 |
+| `created_at` | `BIGINT` | 入库时间（Unix 秒，数据库填充） |
+
+检索链路：先用查询向量在 Qdrant 召回 point id（顺带按 `user_id` / `doc_category` 过滤），
+再按 `vector_id` 回本表取原文——Qdrant 侧因此只存向量与过滤字段，向量库体积与 payload 写入都更小。
+
+### 检索（`app/rag/retriever.py`）
+
+对外只暴露 `search_similar_chunks(query, *, user_id, db, top_k=3)`，三步：
+
+1. 用与入库同一个模型把问题向量化（`core.embed_texts`，维度 / Key 完全共用）
+2. 在 Qdrant 里按余弦相似度取最近 `top_k` 个点，**必带 `user_id` 过滤**：
+   所有用户共用一个 collection，不过滤会召回别人的资料
+3. 拿命中的 point id（== `knowledge_chunks.vector_id`）回 MySQL 批量取原文
+   （`chunk_store.fetch_chunks_by_vector_ids`，**同样带 `user_id` 校验归属**，作为第二道隔离），
+   再按相似度从高到低组装
+
+结果整形：**相似度低于 `MIN_SCORE`（0.4）的命中丢弃**（Qdrant 侧 `score_threshold` 先滤，
+返回前再兜一次）；**单条原文超过 `MAX_TEXT_CHARS`（500 字）截断**（只影响返回值，
+库里原文不动）；`top_k` 由调用方控制，默认 `DEFAULT_TOP_K`（3）。
+
+```python
+from app.rag import search_similar_chunks
+
+hits = search_similar_chunks("HashMap 的扩容因子是多少", user_id=7, db=session, top_k=3)
+context = "\n\n".join(hit.text for hit in hits)   # 直接拼给模型做回答
+for hit in hits:
+    print(hit.score, hit.file_name, hit.chunk_index)
+```
+
+返回 `ChunkHit` 列表（`vector_id` / `text` / `score` / `file_name` / `doc_category` / `chunk_index`，
+可 `as_dict()` 序列化）。边界行为：空问题、`top_k <= 0` 直接返回空列表且不调模型；
+collection 还没建（没上传过文档）返回空列表；向量库有、MySQL 没有的悬空点跳过并告警；
+Qdrant 异常抛 `RETRIEVAL_FAILED`。
+
+### RAG 对话链路（`app/rag/dialogue.py`）
+
+流式聊天按需检索自己的资料并注入本轮上下文，四步都在 `app/rag/dialogue.py`：
+
+1. **意图判断** `should_retrieve(request_text)`：空输入、极短输入（去标点后 < 4 字）、
+   确认语（好的 / 嗯 / ok）、礼貌语（你好 / 谢谢）、推进语（继续 / 下一题）都不检索——
+   这类消息花一次向量化 + 一次向量检索没有收益。短组合（"好的，继续"）同样跳过
+2. **检索** `retrieve_knowledge(query, user_id=…, db=…, top_k=3)`：按 `user_id` 隔离调
+   `search_similar_chunks`；检索失败只记日志，本轮按无资料回答（不影响对话本身）
+3. **注入** `format_retrieved_chunks` 把命中片段排成 `【参考资料】` 文本，
+   `compose_question` 把它拼到**本轮用户问题前**；`build_rag_system_prompt` 只在原
+   system 提示词后补充 `【RAG 回答规则】`（要求引用编号、不许编造），不改写模板正文。
+   注意：注入只进本轮提示词，落库与历史里的 `request_text` 仍是**原始提问**
+4. **来源** `build_sources` 给完整来源（`chunk_id` / `resource_id` / `chunk_index` /
+   `file_name` / `score` / `text`），SSE `done.sources` 下发；
+   `build_references` 给落库引用（只有 `chunk_id` + `score`），写进
+   `chat_messages.reference_sources`——**知识块全文不在消息表重复保存**
+
+```jsonc
+// SSE done 里的 sources
+{"sources": [{"chunk_id": "10cab2fd-…", "resource_id": 13, "chunk_index": 0,
+              "file_name": "java.pdf", "score": 0.7182, "text": "HashMap 底层是数组加链表…"}]}
+```
+
+**历史回显**：`GET /sessions/{id}/messages` 的每条消息带 `sources`（`refreshed` 场景同源）。
+实现是 `resolve_reference_sources` 按 `reference_sources` 里的 `chunk_id` 回查
+`knowledge_chunks` + `resources` 拼回完整来源，并同样按 `user_id` 校验归属；
+引用的知识块已被删除（资源过期清理 / 重新上传覆盖）时，`text` 返回
+**「该参考片段已经删除」**、出处字段为 `null`，`score` 仍回放落库值。列表接口按页只查一次
+（`load_source_index`），回查失败降级为空来源，不让历史列表整体报错。
+
 ## 数据建模（会话 / 消息 / 面试）
 
 三张业务表同在 `app/db/models.py`，对应迁移脚本 `alembic/versions/20260914_0003_create_chat_tables.py`
@@ -179,9 +263,14 @@
 | `request_segments` | `JSON` | 可空 | 提问附件段，只存 `file`/`image`/`audio`，元素如 `{"type":"image","resource_id":13}` |
 | `response_segments` | `JSON` | 可空 | 回复附件段，同上；AI 回复也支持只带附件 |
 | `file_extracted_text` | `MEDIUMTEXT` | 可空 | 从文件提取的完整文本（对话上下文用） |
+| `reference_sources` | `JSON` | 可空 | 本轮回答引用的知识片段，**只存引用不存全文**，元素如 `{"chunk_id":"<knowledge_chunks.vector_id>","score":0.78}` |
 | `created_at` | `BIGINT` | 非空、`DEFAULT (UNIX_TIMESTAMP())` | 创建时间（Unix 秒） |
 
 复合索引 `ix_chat_messages_session_id_created_at`（`session_id`, `created_at`）：按会话拉取消息列表。
+
+`reference_sources` 由 `alembic/versions/20261004_0009_add_chat_message_reference_sources.py` 追加：
+正文（知识块全文）只在 `knowledge_chunks` 存一份，消息表只记 chunk_id 与相似度，
+历史消息接口据此回查原文重新拼出 `sources`（见下文「RAG 对话链路」）。
 
 ### `interviews`（面试记录）
 
@@ -343,6 +432,9 @@ APP_ENV=prod uv run uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `RESOURCE_TTL_SHORT_SECONDS` | `storage_scene=1` 资源过期时间 | `7200`（2 小时） | 同左 |
 | `DASHSCOPE_API_KEY` | RAG 文本向量化 Key（敏感，`SecretStr`），缺失时上传仍成功但跳过入库 | 空 | 密钥管理服务注入 |
 | `EMBEDDING_MODEL` / `EMBEDDING_DIM` / `EMBEDDING_BATCH_SIZE` | 向量化模型 / 维度 / 单批条数（DashScope 单次上限 25） | `qwen3.7-text-embedding` / `1024` / `10` | 换模型时 `EMBEDDING_DIM` 必须与 Qdrant 建库维度一致 |
+| `OCR_ENABLED` / `PDF_SCANNED_MIN_CHARS_PER_PAGE` | 扫描件 OCR 兜底开关 / 判定阈值（平均每页字符数） | `true` / `20` | 纯文本库可关掉兜底，省去外部调用 |
+| `OCR_BASE_URL` / `OCR_MODEL` / `OCR_TIMEOUT` | OCR 服务地址 / 模型名 / 单页超时（Key 复用 `DASHSCOPE_API_KEY`） | MaaS `.../compatible-mode/v1` / `vanchin/deepseek-ocr` / `60` | 换网关只改这两项 |
+| `OCR_RENDER_DPI` / `OCR_MAX_PAGES` | 渲染清晰度 / 单文档识别页数上限 | `150` / `50` | 页数上限防止大扫描件拖死上传请求 |
 | `QDRANT_HOST` / `QDRANT_PORT` | 向量库地址（collection `knowledge_chunks` 不存在时自动创建） | `127.0.0.1` / `6333` | 指向内网向量库 |
 | `RAG_INGEST_ENABLED` | 上传文件后是否自动向量化入库 | `true` | `true`（不需要时置 `false`） |
 | `RESOURCE_CLEANUP_HOUR` / `RESOURCE_CLEANUP_MINUTE` | 过期清理触发时刻 | `3` / `0`（每天 03:00） | 同左 |
@@ -607,10 +699,26 @@ def list_orders(current_user: CurrentUserDep) -> list[Order]:
   非法值返回 `422 INVALID_DOC_CATEGORY`。去重命中时，本次**显式带上的分类会覆盖旧值**，
   没带（空）则保留原值
 - RAG 入库：**文件类型**落库成功后自动调用 `app/rag/core.py` 的 `ingest_file`
-  （解析 -> 清洗 -> 分类 -> 分块 -> DashScope qwen3.7-text-embedding 向量化 -> 写 Qdrant），
+  （解析 -> 清洗 -> 分类 -> 分块 -> DashScope qwen3.7-text-embedding 向量化 -> 写 Qdrant
+  -> 分块原文写 MySQL `knowledge_chunks`），
   `doc_category` 原样透传，为空时由 RAG 侧按关键字自动分类；结果通过
   `rag_ingested` / `rag_chunk_count` / `rag_error` 回给前端。
   图片 / 音频、`storage_scene=2`、去重命中的重复上传都不入库
+- 分块存储分两份：**Qdrant 只存向量 + 过滤字段**（`user_id` / `doc_category` / `file_name` /
+  `chunk_index`，不存原文），**原文存 MySQL `knowledge_chunks`**，两边用入库时生成的
+  同一个 UUID 关联（Qdrant point id == `vector_id`）。落库顺序是先 Qdrant 后 MySQL，
+  分块写入包在 savepoint 里，失败只回滚分块、不影响 `resources` 落库与上传结果
+- PDF 解析：`pypdfium2` 抽文本层；**平均每页字符数 < `PDF_SCANNED_MIN_CHARS_PER_PAGE`（默认 20）**
+  判定为扫描件，转 `app/rag/ocr.py` 的 `ocr_pdf` 兜底——按 `OCR_RENDER_DPI`（默认 150）渲染每页为
+  PNG，base64 上送视觉 OCR 模型（`OCR_MODEL`，OpenAI 兼容协议），按页序按行拼成全文。
+  单个 PDF 最多识别 `OCR_MAX_PAGES`（默认 50）页；`OCR_ENABLED=false` 关闭兜底后扫描件只剩文本层
+- 分块：`RecursiveCharacterTextSplitter` 递归切片（`chunk_size=500` / `chunk_overlap=50`），
+  分隔符优先级 `\n###` -> `\n##` -> `\n#` -> `\n\n` -> `\n` -> `。！？；，` -> 空格 -> 字符兜底；
+  DOCX 的 Heading 1/2/3 会先注入 `#` / `##` / `###`，切块因此能顺着标题与句子边界走
+- 向量入库是**覆盖**语义：同一个 `(user_id, file_name)` 重复上传（内容变了）时，
+  写库前先按 `user_id` + `file_name` 删除旧数据（Qdrant 删点、MySQL 删分块行），再写本次新数据，
+  避免新旧点并存、同一条资料被检索出重复片段。注意顺序是**先删后写**：
+  upsert 失败时该文件的旧分块已删除（不会残留重复，重新上传即可恢复）
 - `storage_scene=2`：只读内容、不传对象、不写元数据，`extracted_text` 直接返回提取到的文本
 - 过期时间：`storage_scene=0` 为 1 个月，`=1` 为 2 小时，写入 `resources.expire_time`
 - 安全：只取上传文件名的 basename，防目录穿越；扩展名做字符白名单
@@ -658,7 +766,8 @@ curl -X POST http://127.0.0.1:8000/upload/file \
 
 > RAG 入库是**增强能力**：没配 `DASHSCOPE_API_KEY`、Qdrant 不可用、文件类型 RAG 不支持（只支持
 > `pdf` / `docx` / `txt`）时，上传接口依然 `201`，原因放在 `rag_error`
-> （`RAG_DISABLED` / `RAG_UNAVAILABLE` / `RAG_NOT_CONFIGURED` / `UNSUPPORTED_FILE_TYPE` / `RAG_INGEST_FAILED`）。
+> （`RAG_DISABLED` / `RAG_UNAVAILABLE` / `RAG_NOT_CONFIGURED` / `UNSUPPORTED_FILE_TYPE` /
+> `OCR_FAILED`（扫描件渲染或识别失败）/ `RAG_INGEST_FAILED`）。
 
 > 依赖：文件上传需 `python-multipart==0.0.9`，对象存储用 `boto3`（均已在 `pyproject.toml` 固定，`uv sync` 自动安装）。
 
@@ -741,8 +850,11 @@ event: delta
 data: {"content":"索引"}
 
 event: done
-data: {"request_id":"9f1c…","message_id":35,"session_id":12,"answer_length":188,"prompt_versions":"common=v1,private=v2","search_hits":1,"elapsed_ms":1740}
+data: {"request_id":"9f1c…","message_id":35,"session_id":12,"answer_length":188,"prompt_versions":"common=v1,private=v2","search_hits":1,"sources":[{"chunk_id":"10cab2fd…","resource_id":13,"chunk_index":0,"file_name":"java.pdf","score":0.7182,"text":"HashMap 底层是数组加链表…"}],"elapsed_ms":1740}
 ```
+
+`done.sources` 是本轮回答引用的知识片段（问答没引用资料时为空数组），前端据此渲染来源卡片。
+下一节「RAG 对话链路」说明这些片段是怎么选出来、怎么注入、怎么落库与回显的。
 
 ```bash
 curl -N -X POST http://127.0.0.1:8000/api/v1/sessions/12/stream-chat \

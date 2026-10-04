@@ -9,8 +9,9 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Sequence
-from typing import Any
+from typing import Any, Mapping
 
 from starlette.concurrency import run_in_threadpool
 
@@ -22,6 +23,8 @@ from app.db.models import ChatMessage, ChatSession, Interview, Resource, User
 from app.db.resource_repository import ResourceRepository
 from app.db.session_repository import ChatSessionRepository
 from app.schemas.chat import MessagePublic, MessageSegment, SessionCreate, SessionUpdate
+
+logger = logging.getLogger("app.chat")
 
 SEGMENT_TYPES = frozenset({"file", "image", "audio"})
 
@@ -91,13 +94,58 @@ class ChatService:
     def list_messages(
         self, user: User, session_id: int, *, page: int, page_size: int
     ) -> tuple[list[MessagePublic], int]:
-        """分页返回会话内的消息，附件段补齐 name / url / size，并带上面试卡片信息。"""
+        """分页返回会话内的消息：附件段补齐 name / url / size，知识来源按引用回查原文。"""
         self._require_session(user, session_id)
         messages, total = self.messages.list_by_session(session_id, page=page, page_size=page_size)
         interviews = self.interviews.find_by_message_ids([message.id for message in messages])
         resources = self.resources.find_by_ids(_segment_resource_ids(messages))
+        sources = self._resolve_sources(messages, user_id=user.id)
 
-        return [self._to_public(message, interviews.get(message.id), resources) for message in messages], total
+        return [
+            self._to_public(message, interviews.get(message.id), resources, sources.get(message.id, []))
+            for message in messages
+        ], total
+
+    def _resolve_sources(
+        self,
+        messages: Sequence[ChatMessage],
+        *,
+        user_id: int,
+    ) -> dict[int, list[dict[str, Any]]]:
+        """历史回显：按 reference_sources 里的 chunk_id 回查知识库，拼出完整 sources。
+
+        消息表只存了 chunk_id + score，原文不重复保存，所以这里必须回查；
+        片段已被删除（资源过期清理 / 重新上传覆盖）时正文是「该参考片段已经删除」。
+        回查失败只记日志并降级为空来源，不让历史列表整体报错。
+        """
+        references = {
+            message.id: message.reference_sources
+            for message in messages
+            if isinstance(message.reference_sources, list) and message.reference_sources
+        }
+        if not references:
+            return {}
+
+        try:
+            # 延迟导入：向量库 / 向量化依赖较重，缺失时只影响来源回显
+            from app.rag.dialogue import load_source_index, resolve_reference_sources
+
+            chunk_ids = [
+                str(reference["chunk_id"])
+                for message_references in references.values()
+                for reference in message_references
+                if isinstance(reference, Mapping) and reference.get("chunk_id")
+            ]
+            index = load_source_index(self.messages.session, chunk_ids, user_id=user_id)
+            return {
+                message_id: resolve_reference_sources(
+                    self.messages.session, message_references, user_id=user_id, index=index
+                )
+                for message_id, message_references in references.items()
+            }
+        except Exception as exc:  # noqa: BLE001 - 来源是增强信息，失败降级为空
+            logger.warning("历史消息来源回查失败，本次不返回 sources：%r", exc)
+            return {}
 
     def get_interview(self, user: User, interview_id: int) -> Interview:
         """按 interview_id + 当前用户查询面试详情（含 qa_object）。"""
@@ -118,8 +166,9 @@ class ChatService:
         message: ChatMessage,
         interview: Interview | None,
         resources: dict[int, Resource],
+        sources: list[dict[str, Any]] | None = None,
     ) -> MessagePublic:
-        """消息行 -> 对外响应：正文 + 附件段 + 面试状态。"""
+        """消息行 -> 对外响应：正文 + 附件段 + 知识来源 + 面试状态。"""
         return MessagePublic(
             id=message.id,
             session_id=message.session_id,
@@ -129,6 +178,7 @@ class ChatService:
             response_text=message.response_text,
             request_segments=_enrich(message.request_segments, resources, self.storage),
             response_segments=_enrich(message.response_segments, resources, self.storage),
+            sources=sources or [],
             status=interview.status if interview else None,
             interview_id=interview.id if interview else None,
             created_at=message.created_at,

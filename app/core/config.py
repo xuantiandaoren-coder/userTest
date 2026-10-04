@@ -162,6 +162,19 @@ class Settings(BaseSettings):
     embedding_dim: int = 1024
     # 单次向量化请求的文本条数（DashScope 单次上限 25）
     embedding_batch_size: int = 10
+    # 扫描版 PDF 的 OCR 兜底（见 app/rag/ocr.py）：渲染成图片 -> 视觉 OCR 模型 -> 按行拼接
+    # 关掉后扫描件只走文本层，抽不到内容就是空文本（分块为空，跳过入库）
+    ocr_enabled: bool = True
+    # OCR 走 OpenAI 兼容协议，默认是 MaaS 上的 deepseek-ocr 视觉模型
+    ocr_base_url: str = "https://llm-sg08ps0ta5j51i2i.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"
+    ocr_model: str = "vanchin/deepseek-ocr"
+    ocr_timeout: int = 60             # 单页识别超时（秒）
+    # 渲染清晰度（DPI）：150 与识别参考实现一致，再高收益有限却更慢更贵
+    ocr_render_dpi: int = 150
+    # 单个 PDF 最多识别页数，避免几百页扫描件把上传请求拖死（超出部分只记日志）
+    ocr_max_pages: int = 50
+    # 平均每页字符数低于该值判定为扫描件，走 OCR 兜底
+    pdf_scanned_min_chars_per_page: int = 20
     qdrant_host: str = "127.0.0.1"   # Qdrant 服务地址
     qdrant_port: int = 6333          # Qdrant HTTP 端口
     # 上传文件后自动向量化入库；失败只记日志、不影响上传结果（向量化是增强能力）

@@ -1,6 +1,6 @@
 """数据库层：ORM 模型（SQLAlchemy 2.0 声明式风格）。
 
-包含用户、会话、消息、面试记录、资源元数据、提示词模板、用户背景画像七张表。
+包含用户、会话、消息、面试记录、资源元数据、知识库分块原文、提示词模板、用户背景画像八张表。
 """
 
 from __future__ import annotations
@@ -123,6 +123,9 @@ class ChatMessage(Base):
       元素形如 ``{"type": "image", "resource_id": 13}``，无附件时为 NULL；
       返回时按 resource_id 关联 resources 补上 name / url / size
     - file_extracted_text：上传文件中提取的文本，作为对话上下文，无文件时为空
+    - reference_sources：本轮回答引用的知识片段，元素形如
+      ``{"chunk_id": "<knowledge_chunks.vector_id>", "score": 0.78}``；**只存引用不存全文**，
+      历史回显时按 chunk_id 回查 knowledge_chunks + resources 重新拼出 sources
     - (session_id, created_at) 复合索引：按会话拉取消息列表
     """
 
@@ -157,6 +160,11 @@ class ChatMessage(Base):
         medium_text(),
         nullable=True,
         comment="从文件中提取的完整文本（对话上下文用）",
+    )
+    reference_sources: Mapped[list[dict[str, Any]] | None] = mapped_column(
+        JSON,
+        nullable=True,
+        comment='回答引用的知识片段（只存引用不存全文），元素如 {"chunk_id":"<vector_id>","score":0.78}',
     )
     created_at: Mapped[int] = mapped_column(
         BigInteger,
@@ -275,6 +283,51 @@ class Resource(Base):
         nullable=False,
         server_default=func.now(),
         comment="创建时间",
+    )
+
+
+class KnowledgeChunk(Base):
+    """知识库分块原文表：向量存 Qdrant，原文存这里，两边用同一个 UUID 关联。
+
+    - resource_id：关联 resources.id，说明这块内容属于哪次上传的文件
+    - vector_id：Qdrant point id，入库时生成的 UUID，两边同值
+    - chunk_index：文件内的分块序号（从 0 开始，与 Qdrant payload 里的同名字段一致）
+    - char_count：分块字符数（切片长度，省去检索侧每次算 length(text)）
+    - text：分块原文（PDF / DOCX 解析出来的长文本，用 MEDIUMTEXT 够放）
+    - created_at：入库时间（Unix 秒，与 sessions / chat_messages 等表一致）
+
+    职责分工：Qdrant 只存向量 + 过滤字段（user_id / doc_category / file_name / chunk_index），
+    不再存原文；检索先用向量召回 vector_id，再回本表按 vector_id 取原文。
+    资源过期被清理时本表跟随删除（外键 ON DELETE CASCADE）。
+    """
+
+    __tablename__ = "knowledge_chunks"
+    __table_args__ = (
+        Index("uk_knowledge_chunks_vector_id", "vector_id", unique=True),
+        Index("ix_knowledge_chunks_resource_id", "resource_id"),
+        {"comment": "知识库分块原文表", "mysql_charset": "utf8mb4", "mysql_engine": "InnoDB"},
+    )
+
+    id: Mapped[int] = mapped_column(big_int(), primary_key=True, autoincrement=True, comment="自增主键")
+    resource_id: Mapped[int] = mapped_column(
+        big_int(),
+        ForeignKey("resources.id", ondelete="CASCADE"),
+        nullable=False,
+        comment="所属资源ID（resources.id）",
+    )
+    vector_id: Mapped[str] = mapped_column(
+        String(36),
+        nullable=False,
+        comment="Qdrant point id：入库时生成的 UUID，与向量库同值关联",
+    )
+    chunk_index: Mapped[int] = mapped_column(Integer, nullable=False, comment="文件内分块序号，从 0 开始")
+    char_count: Mapped[int] = mapped_column(Integer, nullable=False, comment="分块字符数")
+    text: Mapped[str] = mapped_column(medium_text(), nullable=False, comment="分块原文")
+    created_at: Mapped[int] = mapped_column(
+        BigInteger,
+        nullable=False,
+        server_default=unix_timestamp(),
+        comment="入库时间（Unix 秒）",
     )
 
 

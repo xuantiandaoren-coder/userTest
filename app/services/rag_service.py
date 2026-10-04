@@ -1,11 +1,14 @@
 """业务层：上传文件后的 RAG 向量化入库（best-effort，不阻断上传）。
 
 链路：上传落库成功 -> ``ingest_file``（app/rag/core.py）解析 -> 清洗 -> 分类 -> 分块
--> DashScope 向量化 -> 写 Qdrant，payload 带 user_id / doc_category / file_name / chunk_index。
+-> DashScope 向量化 -> 写 Qdrant（只存向量 + 过滤字段）-> 写 MySQL ``knowledge_chunks``
+（分块原文，两边用同一个 UUID 关联），最后在这里 commit。
 
 约定：
 - 只有**文件类型**（document）且本次真的写了 ``resources`` 元数据的上传才入库；
   图片 / 音频、``storage_scene=2``（只提取内容不落库）、去重命中的重复上传都不入库
+- 分块原文写入用独立 savepoint（见 app/rag/chunk_store.py）：分块写失败只回滚分块，
+  不会连带回滚调用方同一事务里的 resources 落库，上传接口照旧返回 201
 - 向量化属于增强能力，任何失败（没配 Key、类型不支持、Qdrant 不可用等）都只记日志，
   由 ``RagIngestResult.error`` 回给调用方，上传接口本身仍然成功
 - 开关：``settings.rag_ingest_enabled``（``RAG_INGEST_ENABLED``，默认开）
@@ -16,6 +19,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 
+from sqlalchemy.orm import Session
 from starlette.concurrency import run_in_threadpool
 
 from app.core.config import settings
@@ -47,8 +51,15 @@ class RagIngestService:
         file_name: str,
         user_id: int,
         doc_category: str | None = None,
+        db: Session | None = None,
+        resource_id: int | None = None,
     ) -> RagIngestResult:
-        """向量化入库；``doc_category``（resume/study_material/general）优先于关键字自动分类。"""
+        """向量化入库，并把分块原文写进 MySQL。
+
+        - ``doc_category``（resume / study_material / general）优先于关键字自动分类
+        - ``db`` / ``resource_id``：上传链路传入的会话与资源主键，写完 Qdrant 后用它落分块原文；
+          缺省则不落原文（离线调试用），向量库已不存原文，检索会取不到内容
+        """
         if not self.enabled:
             return RagIngestResult(ingested=False, error="RAG_DISABLED")
 
@@ -62,7 +73,12 @@ class RagIngestService:
                 file_name,
                 user_id=user_id,
                 doc_category=doc_category,
+                db=db,
+                resource_id=resource_id,
             )
+            # 写完 Qdrant + 分块原文后统一提交，让 resources / knowledge_chunks 落在同一个事务里
+            if db is not None:
+                db.commit()
         except ImportError as exc:  # rag 依赖未安装：跳过入库
             logger.warning("RAG 依赖不可用，跳过入库 file=%s error=%r", file_name, exc)
             return RagIngestResult(ingested=False, error="RAG_UNAVAILABLE")

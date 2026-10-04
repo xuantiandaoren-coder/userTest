@@ -53,6 +53,22 @@ class MessageSegment(BaseModel):
     url: str | None = None
 
 
+class MessageSource(BaseModel):
+    """回答引用的知识片段。
+
+    落库只存 chunk_id + score（见 chat_messages.reference_sources），
+    其余字段（资源 / 分块序号 / 文件名 / 原文）在读取时回查 knowledge_chunks + resources。
+    片段被删除时 text 为「该参考片段已经删除」，出处字段为 null。
+    """
+
+    chunk_id: str = Field(description="知识分块 id，等于 knowledge_chunks.vector_id（Qdrant point id）")
+    resource_id: int | None = Field(default=None, description="所属资源 id（resources.id）；片段已删除时为 null")
+    chunk_index: int | None = Field(default=None, description="文件内分块序号，从 0 开始")
+    file_name: str | None = Field(default=None, description="来源文件名")
+    score: float | None = Field(default=None, description="检索相似度")
+    text: str = Field(description="分块原文；片段已删除时为「该参考片段已经删除」")
+
+
 class MessagePublic(BaseModel):
     """聊天消息对外响应：正文 + 附件段 + 面试卡片信息。"""
 
@@ -64,6 +80,7 @@ class MessagePublic(BaseModel):
     response_text: str
     request_segments: list[MessageSegment] = Field(default_factory=list)
     response_segments: list[MessageSegment] = Field(default_factory=list)
+    sources: list[MessageSource] = Field(default_factory=list, description="本轮回答引用的知识片段（历史按引用回查）")
     status: int | None = Field(default=None, description="关联面试的状态：0=进行中，1=已结束，2=异常终止；非面试消息为 null")
     interview_id: int | None = Field(default=None, description="该消息开启的面试记录 id，非面试消息为 null")
     created_at: int

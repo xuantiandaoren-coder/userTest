@@ -162,12 +162,14 @@ class SeaweedFSUploadService:
         resource: Resource,
         deduplicated: bool,
     ) -> RagIngestResult | None:
-        """把刚落库的文件送进 RAG（解析 -> 分块 -> 向量化 -> 写 Qdrant）。
+        """把刚落库的文件送进 RAG（解析 -> 分块 -> 向量化 -> 写 Qdrant -> 分块原文写 MySQL）。
 
         只对文件类型、且本次真的新增了元数据的上传入库：
         - 图片 / 音频：没有文档语义，不入库
         - 去重命中：内容早就入过库，重复入库只会在向量库里堆重复点
         - 未接 RAG 服务（测试 / 未注入依赖）：直接跳过
+
+        会话与资源主键一起传下去：分块原文要关联到这次落库的 resources 行。
         """
         if self.rag is None or content.kind is not FileKind.DOCUMENT:
             return None
@@ -179,6 +181,8 @@ class SeaweedFSUploadService:
             file_name=resource.file_name,
             user_id=user.id,
             doc_category=resource.doc_category,
+            db=self.resources.session,
+            resource_id=resource.id,
         )
 
     @staticmethod
