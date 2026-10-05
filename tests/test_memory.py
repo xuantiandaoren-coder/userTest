@@ -1,7 +1,7 @@
-"""记忆层测试：历史轮次构建 + 搜索增强（关键词抽取、打分、片段、失败降级）。
+"""记忆层测试：MemoryService 统一入口 + 搜索增强（关键词抽取、打分、片段、失败降级）。
 
-记忆层只做两件事：把本会话最近 N 轮问答变成 LangChain 消息序列，以及从历史消息里
-检索出跨会话的相关片段拼成参考文本。模型与提示词都不在这一层，所以这里不需要网络。
+短期记忆的读取细节（轮数 / 字符预算 / 消息格式）在 tests/test_instant_memory.py；
+这里验证统一入口把短期记忆与搜索增强组装成 MemoryContext。模型与提示词都不在这一层。
 """
 
 from __future__ import annotations
@@ -14,14 +14,13 @@ from app.db.chat_message_repository import ChatMessageRepository
 from app.db.models import ChatMessage
 from app.memory.memory import (
     DatabaseSearchBackend,
-    MemoryBuilder,
     MemoryConfig,
     build_searchable_text,
     extract_keywords,
-    history_from_pairs,
     make_snippet,
     rank_hits,
 )
+from app.memory.service import MemoryService
 
 USER_ID = 7
 CURRENT_SESSION = 1
@@ -53,9 +52,9 @@ def _add_message(
 
 
 @pytest.fixture()
-def builder(db_session: Session) -> MemoryBuilder:
-    """挂在测试会话上的记忆层构建器（历史轮数上限 3 轮，便于断言截断）。"""
-    return MemoryBuilder(
+def builder(db_session: Session) -> MemoryService:
+    """挂在测试会话上的记忆层服务（历史轮数上限 3 轮，便于断言截断）。"""
+    return MemoryService(
         ChatMessageRepository(db_session),
         config=MemoryConfig(max_turns=3, max_chars=2000, search_top_k=2),
     )
@@ -134,23 +133,14 @@ def test_build_searchable_text_merges_body_and_file_text(db_session: Session) ->
     assert build_searchable_text(message) == "问题 回答 附件正文"
 
 
-def test_history_from_pairs_builds_role_messages() -> None:
-    messages = history_from_pairs([("问题一", "回答一"), ("问题二", "")])
-
-    assert [type(item) for item in messages] == [HumanMessage, AIMessage, HumanMessage]
-    assert messages[0].content == "问题一"
-    assert messages[-1].content == "问题二"
-    assert history_from_pairs([]) == []
-
-
 # ---------------------------------------------------------------------------
-# 历史记忆
+# 短期记忆（细节在 tests/test_instant_memory.py，这里验证入口组装）
 # ---------------------------------------------------------------------------
-def test_build_keeps_recent_turns_in_order(builder: MemoryBuilder, db_session: Session) -> None:
+def test_build_keeps_recent_turns_in_order(builder: MemoryService, db_session: Session) -> None:
     for index in range(1, 6):
         _add_message(db_session, session_id=CURRENT_SESSION, request_text=f"问题{index}", response_text=f"回答{index}")
 
-    context = builder.build(user_id=USER_ID, session_id=CURRENT_SESSION, query="随便问问", use_search=False)
+    context = builder.load(user_id=USER_ID, session_id=CURRENT_SESSION, query="随便问问", use_search=False)
 
     assert context.turns == [("问题3", "回答3"), ("问题4", "回答4"), ("问题5", "回答5")]  # 只保留最近 3 轮
     assert [item.content for item in context.messages] == ["问题3", "回答3", "问题4", "回答4", "问题5", "回答5"]
@@ -158,14 +148,14 @@ def test_build_keeps_recent_turns_in_order(builder: MemoryBuilder, db_session: S
 
 
 def test_build_drops_oldest_turns_when_history_is_too_long(db_session: Session) -> None:
-    builder = MemoryBuilder(
+    builder = MemoryService(
         ChatMessageRepository(db_session),
         config=MemoryConfig(max_turns=5, max_chars=20, search_enabled=False),
     )
     _add_message(db_session, session_id=CURRENT_SESSION, request_text="旧" * 15, response_text="旧答")
     _add_message(db_session, session_id=CURRENT_SESSION, request_text="新问题", response_text="新回答")
 
-    context = builder.build(user_id=USER_ID, session_id=CURRENT_SESSION, query="q")
+    context = builder.load(user_id=USER_ID, session_id=CURRENT_SESSION, query="q")
 
     assert context.turns == [("新问题", "新回答")]  # 超出字符上限的最旧轮次被丢掉
 
@@ -173,7 +163,7 @@ def test_build_drops_oldest_turns_when_history_is_too_long(db_session: Session) 
 # ---------------------------------------------------------------------------
 # 搜索增强
 # ---------------------------------------------------------------------------
-def test_build_injects_search_hits_from_other_sessions(builder: MemoryBuilder, db_session: Session) -> None:
+def test_build_injects_search_hits_from_other_sessions(builder: MemoryService, db_session: Session) -> None:
     _add_message(
         db_session,
         session_id=2,
@@ -184,7 +174,7 @@ def test_build_injects_search_hits_from_other_sessions(builder: MemoryBuilder, d
     _add_message(db_session, session_id=CURRENT_SESSION, request_text="MySQL 索引优化", request_id="current-1")
     _add_message(db_session, session_id=3, request_text="MySQL 索引优化", user_id=USER_ID + 1, request_id="other-user")
 
-    context = builder.build(user_id=USER_ID, session_id=CURRENT_SESSION, query="MySQL 索引优化")
+    context = builder.load(user_id=USER_ID, session_id=CURRENT_SESSION, query="MySQL 索引优化")
 
     assert len(context.search_hits) == 1                                  # 当前会话 / 别人的消息都不算
     assert context.search_hits[0].session_id == 2
@@ -194,20 +184,20 @@ def test_build_injects_search_hits_from_other_sessions(builder: MemoryBuilder, d
     assert context.summary == "history_turns=1 search_hits=1"  # 当前会话那轮进历史，检索只补别的会话
 
 
-def test_build_respects_search_top_k(builder: MemoryBuilder, db_session: Session) -> None:
+def test_build_respects_search_top_k(builder: MemoryService, db_session: Session) -> None:
     for index in range(5):
         _add_message(db_session, session_id=10 + index, request_text=f"索引优化 {index}", request_id=f"h{index}")
 
-    context = builder.build(user_id=USER_ID, session_id=CURRENT_SESSION, query="索引优化")
+    context = builder.load(user_id=USER_ID, session_id=CURRENT_SESSION, query="索引优化")
 
     assert len(context.search_hits) == 2  # search_top_k=2
 
 
-def test_build_skips_search_when_disabled_or_query_is_empty(builder: MemoryBuilder, db_session: Session) -> None:
+def test_build_skips_search_when_disabled_or_query_is_empty(builder: MemoryService, db_session: Session) -> None:
     _add_message(db_session, session_id=2, request_text="索引优化", request_id="h1")
 
-    assert builder.build(user_id=USER_ID, session_id=CURRENT_SESSION, query="索引优化", use_search=False).search_hits == []
-    assert builder.build(user_id=USER_ID, session_id=CURRENT_SESSION, query="") .search_hits == []
+    assert builder.load(user_id=USER_ID, session_id=CURRENT_SESSION, query="索引优化", use_search=False).search_hits == []
+    assert builder.load(user_id=USER_ID, session_id=CURRENT_SESSION, query="") .search_hits == []
 
 
 def test_search_failure_only_adds_warning(db_session: Session) -> None:
@@ -217,14 +207,14 @@ def test_search_failure_only_adds_warning(db_session: Session) -> None:
         def search(self, **_: object) -> list[object]:
             raise RuntimeError("search backend down")
 
-    builder = MemoryBuilder(
+    builder = MemoryService(
         ChatMessageRepository(db_session),
         search_backend=BrokenBackend(),  # type: ignore[arg-type]
         config=MemoryConfig(max_turns=3),
     )
     _add_message(db_session, session_id=CURRENT_SESSION, request_text="问题", response_text="回答")
 
-    context = builder.build(user_id=USER_ID, session_id=CURRENT_SESSION, query="问题")
+    context = builder.load(user_id=USER_ID, session_id=CURRENT_SESSION, query="问题")
 
     assert context.turns == [("问题", "回答")]      # 检索失败不影响历史
     assert context.search_context == ""

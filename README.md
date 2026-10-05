@@ -48,7 +48,9 @@
 │   ├── llm
 │   │   └── llm.py              # 模型层：provider -> 模型实例（DeepSeek/OpenAI/通义/…）
 │   ├── memory
-│   │   └── memory.py           # 记忆层：历史轮次构建 + 跨会话检索增强
+│   │   ├── instant.py          #   短期记忆：最近 N 轮 -> 字符预算裁剪 -> LangChain 消息
+│   │   ├── service.py          #   记忆层统一入口（短期记忆 + 搜索增强，预留工作 / 长期记忆）
+│   │   └── memory.py           #   公共构件：MemoryConfig / MemoryContext / 搜索增强后端
 │   ├── prompts
 │   │   ├── prompt_template_manager.py  # 版本计算 / Redis 缓存 / 公共+私有拼接 / 一键回滚
 │   │   ├── injector.py         # 变量注入：验证层 -> 转换层 -> 填充层
@@ -826,7 +828,7 @@ curl -X POST http://127.0.0.1:8000/upload/file \
 | --- | --- | --- | --- |
 | 模型层 | `app/llm/llm.py` | provider -> `BaseChatModel` 实例 | 不拼提示词、不读历史 |
 | 提示词层 | `app/prompts/prompt_layer.py` | `ChatPromptTemplate` + LCEL 链路组装 | 不管模板存哪、不管历史怎么取 |
-| 记忆层 | `app/memory/memory.py` | 历史轮次构建 + 搜索增强 | 不选模型、不拼最终提示词 |
+| 记忆层 | `app/memory/service.py`（入口）/ `instant.py`（短期记忆）/ `memory.py`（公共构件） | 短期记忆 + 搜索增强 | 不选模型、不拼最终提示词 |
 
 组装方式（`app/services/stream_chat_service.py`）：
 
@@ -881,14 +883,32 @@ curl -N -X POST http://127.0.0.1:8000/api/v1/sessions/12/stream-chat \
    因此最后一步落库用独立会话工厂写入 `chat_messages`（`request_id` 与 `meta` 事件对齐，便于排查/幂等）；
    客户端中途断开时也会尽力把已生成的部分落库，落库失败只记日志，不影响已经发给用户的回答
 
-### 记忆层的搜索增强
+### 记忆层（短期记忆 + 搜索增强）
 
-- **历史记忆**：本会话最近 `LLM_HISTORY_TURNS` 轮问答 -> LangChain 消息序列（按轮数与总字符数双重截断）
+记忆层拆成三个模块，主业务流程（`StreamChatService`）只依赖 `MemoryService.load()` 一个方法：
+
+| 模块 | 职责 |
+| --- | --- |
+| `app/memory/service.py` | **统一入口**：组装短期记忆 + 搜索增强，返回 `MemoryContext`；工作记忆 / 长期记忆后续在这里接入 |
+| `app/memory/instant.py` | **短期记忆** `InstantMemory.load(session_id)`：`_load_recent_rows`（按 `created_at` 倒序取最近 N 轮）-> `_fit_char_budget`（超预算丢最旧）-> `build_chat_history_from_rows`（提问 -> `HumanMessage`、回答 -> `AIMessage`） |
+| `app/memory/memory.py` | 公共构件：`MemoryConfig`、`MemoryContext`、搜索增强后端与打分函数 |
+
+- **短期记忆**：本会话最近 `LLM_HISTORY_TURNS` 轮问答 -> LangChain 消息序列（按轮数与总字符数双重截断）。
+  读取顺序固定为"倒序取最近 N 轮 -> 字符预算裁剪 -> 格式化"，返回的 `InstantMemoryContext`
+  带 `turns` / `messages` / `chars` / `truncated`，便于日志与后续调优
 - **搜索增强**：从该用户**其它会话**的消息正文 / 附件提取文本里做关键词召回 + 打分，取 top-k 片段进 system
   （当前会话的历史已经在对话上下文里，不重复检索）
 - 检索后端是 `SearchBackend` 协议，默认 `DatabaseSearchBackend`（纯 SQL `LIKE`，MySQL / SQLite 行为一致）；
   换向量库 / ES 只需实现同一个 `search()` 方法并注入，记忆层其余逻辑不用改
 - 检索失败只记 WARNING 并附带一条 `warnings`（SSE `meta` 事件里可见），不让聊天整体不可用
+
+```python
+from app.memory import MemoryConfig, MemoryService
+
+service = MemoryService(ChatMessageRepository(session), config=MemoryConfig(max_turns=10, max_chars=6000))
+memory = service.load(user_id=1, session_id=12, query="MySQL 索引优化")   # -> MemoryContext
+prompt = build_system_prompt(composed, variables, memory=memory)
+```
 
 模型层可选 provider：`deepseek`（默认）/ `openai` / `dashscope` / `moonshot` / `zhipu` / `ollama`，
 都走 OpenAI 兼容协议，换 provider 只改 `LLM_PROVIDER`（自建网关可配 `LLM_BASE_URL`）；
@@ -1062,5 +1082,6 @@ AI 聊天这条链路另有 6 个测试文件、85 条用例，全部离线（�
 - `tests/test_prompt_injector.py`：变量注入三层（白名单 / 注入特征 / 长度限制、数组与数字格式化、单次替换防二次注入）
 - `tests/test_prompt_template_manager.py`：版本自增与分组独立、同组仅一条生效、Redis 预热 / 命中 / 回写 / 降级、公共+私有拼接、一键回滚
 - `tests/test_prompt_api.py`：4 个提示词接口（鉴权、新建版本、查看生效模板、回滚后缓存同步、智能体配置）
-- `tests/test_memory.py` / `tests/test_stream_chat.py`：记忆层（历史截断、关键词召回打分、检索失败降级）与 SSE 全链路
+- `tests/test_instant_memory.py` / `tests/test_memory.py` / `tests/test_stream_chat.py`：记忆层
+  （短期记忆读取与字符预算、关键词召回打分、检索失败降级）与 SSE 全链路
   （事件序列、变量与检索内容真的进了 system、历史进消息序列、落库与模型故障走 `error` 事件）

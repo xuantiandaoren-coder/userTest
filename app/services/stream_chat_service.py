@@ -44,7 +44,8 @@ from app.db.models import User
 from app.db.prompt_template_repository import PromptTemplateRepository
 from app.db.session_repository import ChatSessionRepository
 from app.db.user_profile_repository import UserProfileRepository
-from app.memory.memory import MemoryConfig, MemoryContext, MemoryBuilder
+from app.memory.memory import MemoryConfig, MemoryContext
+from app.memory.service import MemoryService
 from app.prompts.injector import profile_to_variables
 from app.prompts.prompt_layer import PromptContext, build_chain, build_system_prompt, stream_tokens
 from app.prompts.prompt_template_manager import PromptTemplateManager
@@ -108,7 +109,7 @@ class StreamChatService:
         self.persist_factory = persist_factory
         self.model_factory = model_factory
         self.chain = chain
-        self.memory = MemoryBuilder(messages, config=memory_config)
+        self.memory = MemoryService(messages, config=memory_config)
 
     # ------------------------------------------------------------------
     # 第一步：准备（可以有 4xx）
@@ -134,7 +135,7 @@ class StreamChatService:
             scene=agent.scene,
         )
 
-        memory = self.memory.build(
+        memory = self.memory.load(
             user_id=user.id,
             session_id=session_id,
             query=payload.search_query or payload.message,

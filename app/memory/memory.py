@@ -1,13 +1,19 @@
-"""记忆层（第三层）：**只**负责历史记忆构建，并包含搜索增强。
+"""记忆层（第三层）公共构件：配置、数据结构与搜索增强后端。
 
-产出两样东西，都交给提示词层使用：
+真正干活的入口拆成两个模块，本文件只放两边共用的东西：
 
-1. **历史记忆**：本会话最近 N 轮问答 -> LangChain 消息序列（进 MessagesPlaceholder("history")）
-2. **搜索增强**：跨会话检索出的相关片段 -> 文本块（拼进 system，给模型当参考资料）
+- ``InstantMemory``（app/memory/instant.py）：短期记忆，读本会话最近 N 轮 -> LangChain 消息
+- ``MemoryService``（app/memory/service.py）：统一入口，短期记忆 + 搜索增强组装成 ``MemoryContext``
 
-检索后端是可替换的：`SearchBackend` 协议 + 默认的 `DatabaseSearchBackend`
+本文件提供：
+
+1. ``MemoryConfig``：记忆层参数（轮数 / 字符预算 / 检索条数）
+2. ``MemoryContext``：记忆层产出结构（历史消息 + 检索增强文本），提示词层只认它
+3. 搜索增强：检索出的相关片段 -> 文本块（拼进 system，给模型当参考资料）
+
+检索后端是可替换的：``SearchBackend`` 协议 + 默认的 ``DatabaseSearchBackend``
 （MySQL/SQLite 关键词召回）。要换成向量库 / ES / 外部搜索时，
-只要实现同样的 `search()` 并在依赖里注入，记忆层其余逻辑不用改。
+只要实现同样的 ``search()`` 并在 ``MemoryService`` 里注入，记忆层其余逻辑不用改。
 
 不做：不选模型（模型层）、不拼最终提示词（提示词层）、不算版本（模板管理）。
 """
@@ -20,9 +26,8 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Protocol
 
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
+from langchain_core.messages import BaseMessage
 
-from app.core.config import settings
 from app.db.chat_message_repository import ChatMessageRepository
 from app.db.models import ChatMessage
 
@@ -205,75 +210,6 @@ def _push(bucket: list[str], keyword: str) -> None:
         bucket.append(keyword)
 
 
-class MemoryBuilder:
-    """记忆层入口：构建历史记忆 + 搜索增强。"""
-
-    def __init__(
-        self,
-        messages: ChatMessageRepository,
-        *,
-        search_backend: SearchBackend | None = None,
-        config: MemoryConfig | None = None,
-    ) -> None:
-        self.messages = messages
-        self.search_backend = search_backend or DatabaseSearchBackend(messages)
-        self.config = config or MemoryConfig(max_turns=settings.llm_history_turns)
-
-    def build(
-        self,
-        *,
-        user_id: int,
-        session_id: int,
-        query: str,
-        use_search: bool | None = None,
-    ) -> MemoryContext:
-        """构建本次对话的记忆上下文（历史 + 可选的搜索增强）。"""
-        turns = self._load_turns(session_id)
-        context = MemoryContext(turns=turns, messages=history_from_pairs(turns))
-
-        want_search = self.config.search_enabled if use_search is None else use_search
-        if not want_search:
-            return context
-        try:
-            hits = self.search_backend.search(
-                query=query,
-                user_id=user_id,
-                session_id=session_id,
-                limit=self.config.search_candidate_limit,
-            )
-        except Exception as exc:  # 检索是增强项：失败不能让聊天整体不可用
-            logger.warning("搜索增强失败，已跳过：%r", exc)
-            context.warnings.append("搜索增强失败，本次未注入检索资料")
-            return context
-
-        context.search_hits = hits[: self.config.search_top_k]
-        context.search_context = render_search_context(context.search_hits)
-        return context
-
-    def _load_turns(self, session_id: int) -> list[tuple[str, str]]:
-        """取最近 N 条消息组装成问答轮次，并按轮数 / 字符数双重截断。"""
-        messages = self.messages.recent_by_session(session_id, self.config.max_turns * 2)
-        turns: list[tuple[str, str]] = []
-        pending_question: str | None = None
-        for message in messages:
-            question = (message.request_text or "").strip()
-            answer = (message.response_text or "").strip()
-            if question:  # 一条消息就是一轮（提问 + 回答同表）
-                pending_question = question
-            if pending_question is not None:
-                turns.append((pending_question, answer))
-                pending_question = None
-        return _trim_turns(turns, self.config.max_turns, self.config.max_chars)
-
-
-def _trim_turns(turns: list[tuple[str, str]], max_turns: int, max_chars: int) -> list[tuple[str, str]]:
-    """截断策略：先按轮数取最近 N 轮，再按总字符数从最旧的轮次开始丢。"""
-    trimmed = turns[-max_turns:] if max_turns > 0 else []
-    while trimmed and sum(len(question) + len(answer) for question, answer in trimmed) > max_chars:
-        trimmed.pop(0)
-    return trimmed
-
-
 def render_search_context(hits: Sequence[SearchHit]) -> str:
     """把检索命中排成参考资料文本（编号 + 片段）。"""
     if not hits:
@@ -282,14 +218,3 @@ def render_search_context(hits: Sequence[SearchHit]) -> str:
     for index, hit in enumerate(hits, start=1):
         lines.append(f"[{index}] (会话 {hit.session_id}) {hit.snippet}")
     return "\n".join(lines)
-
-
-def history_from_pairs(pairs: Sequence[tuple[str, str]]) -> list[BaseMessage]:
-    """(提问, 回答) 序列 -> LangChain 消息序列（历史以角色消息进上下文，不塞进 system）。"""
-    messages: list[BaseMessage] = []
-    for question, answer in pairs:
-        if question and question.strip():
-            messages.append(HumanMessage(content=question))
-        if answer and answer.strip():
-            messages.append(AIMessage(content=answer))
-    return messages
