@@ -14,11 +14,11 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Iterable, Mapping
 from dataclasses import dataclass, field
 
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import BaseMessage
+from langchain_core.messages import BaseMessage, SystemMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.runnables import Runnable
 
@@ -83,6 +83,48 @@ def build_chat_prompt() -> ChatPromptTemplate:
             ("human", "{question}"),
         ]
     )
+
+
+def merge_system_messages(
+    system: str,
+    history: list[BaseMessage],
+) -> tuple[str, list[BaseMessage]]:
+    """把历史消息里的 SystemMessage 合并进最终 system 提示词。
+
+    记忆层的长期画像以 ``SystemMessage`` 形式插在历史消息最前面；但 LangChain 的
+    对话模板只保留一条 system（模板占位那条），历史里的 system 若原样透传会被
+    下游模型当作普通消息、甚至被部分 provider 丢弃。这里在构建最终 system_prompt
+    之前把它们提取出来、从 ``history`` 中移除，再按出现顺序追加到 ``system`` 末尾，
+    用两个换行分隔。
+
+    返回 ``(合并后的 system, 已移除 SystemMessage 的历史)``；调用方必须使用返回的历史。
+    """
+    blocks = [system.strip()] if system and system.strip() else []
+    kept: list[BaseMessage] = []
+    for message in history:
+        if isinstance(message, SystemMessage):
+            content = _message_content(message)
+            if content:
+                blocks.append(content)
+            continue
+        kept.append(message)
+    return "\n\n".join(blocks), kept
+
+
+def _message_content(message: BaseMessage) -> str:
+    """SystemMessage 内容拍平成文本（兼容内容块列表形式）。"""
+    content = message.content
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, Iterable):
+        pieces: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                pieces.append(item)
+            elif isinstance(item, dict) and isinstance(item.get("text"), str):
+                pieces.append(item["text"])
+        return "".join(pieces).strip()
+    return str(content).strip()
 
 
 def build_chain(llm: BaseChatModel, prompt: ChatPromptTemplate | None = None) -> Runnable:

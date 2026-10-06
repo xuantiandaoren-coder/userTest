@@ -11,6 +11,7 @@ from app.api.auth import router as auth_router
 from app.api.files import router as files_router
 from app.api.health import router as health_router
 from app.api.interviews import router as interviews_router
+from app.api.learning_workflows import router as learning_workflows_router
 from app.api.prompt import router as prompt_router
 from app.api.router import api_router
 from app.api.sessions import router as sessions_router
@@ -98,6 +99,9 @@ def create_app() -> FastAPI:
     # 提示词模板版本管理：/prompt/templates、/prompt/rollback、/prompt/config/agents
     application.include_router(prompt_router)
     application.include_router(prompt_router, prefix="/api/v1", include_in_schema=False)
+    # 学习测评工作流：/learning-workflows/start、/learning-workflows/{run_id}/submit、GET /learning-workflows/{run_id}
+    application.include_router(learning_workflows_router)
+    application.include_router(learning_workflows_router, prefix="/api/v1", include_in_schema=False)
 
     @application.get("/", tags=["meta"])
     def root() -> dict[str, str]:

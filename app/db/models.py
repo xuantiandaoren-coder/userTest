@@ -396,6 +396,8 @@ class UserProfile(Base):
 
     - target_job / years_experience / target_level：目标岗位、工作经验、目标等级
     - target_skills / weak_topics：已掌握技能、薄弱点（JSON 数组，注入前转成顿号分隔文本）
+    - learning_goal / learning_style / interview_focus / long_term_summary：长期记忆字段，
+      由 LongTermMemory 服务从对话中异步抽取沉淀，作为跨会话的用户画像
 
     注入前会经过「验证层 -> 转换层 -> 填充层」三层处理，详见 app/prompts/injector.py。
     """
@@ -417,9 +419,85 @@ class UserProfile(Base):
     target_level: Mapped[str | None] = mapped_column(String(32), nullable=True, comment="目标等级，如 P6 / 高级")
     target_skills: Mapped[list[str] | None] = mapped_column(JSON, nullable=True, comment="已掌握技能（JSON 数组）")
     weak_topics: Mapped[list[str] | None] = mapped_column(JSON, nullable=True, comment="薄弱点（JSON 数组）")
+    learning_goal: Mapped[str | None] = mapped_column(String(255), nullable=True, comment="学习目标（长期记忆）")
+    learning_style: Mapped[str | None] = mapped_column(String(255), nullable=True, comment="学习风格（长期记忆）")
+    interview_focus: Mapped[list[str] | None] = mapped_column(JSON, nullable=True, comment="面试关注点（JSON 数组，长期记忆）")
+    long_term_summary: Mapped[str | None] = mapped_column(medium_text(), nullable=True, comment="长期记忆摘要")
     created_at: Mapped[int] = mapped_column(
         BigInteger,
         nullable=False,
         server_default=unix_timestamp(),
         comment="创建时间（Unix 秒）",
+    )
+
+
+class WorkflowRun(Base):
+    """工作流运行表：保存「跨 HTTP 请求」的流程状态（一人多次测评，每次一行）。
+
+    学习测评分两次请求：start 生成题目（第一次），submit 提交答案评分（第二次）。
+    两次请求之间没有服务端会话，因此完整流程状态序列化进 ``state_json``，
+    第二次请求按 ``run_id`` 恢复题目与上下文，继续跑评分图。
+
+    - run_id：业务主键（UUID hex），对外唯一标识一次运行
+    - workflow_type：工作流类型，当前为 learning_assessment（预留其它工作流复用本表）
+    - status：pending / running / quiz_ready / evaluated / failed
+    - state_json：完整工作流状态（LearningWorkflowState 的 JSON 序列化）
+    - error_message：失败原因（仅失败时有值）
+    - created_at / updated_at / completed_at：Unix 秒时间戳
+    """
+
+    __tablename__ = "workflow_runs"
+    __table_args__ = (
+        Index("ix_workflow_runs_user_id_workflow_type", "user_id", "workflow_type"),
+        {"comment": "工作流运行表（跨请求流程状态）", "mysql_charset": "utf8mb4", "mysql_engine": "InnoDB"},
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True, comment="自增主键")
+    run_id: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+        unique=True,
+        comment="运行 id（对外标识一次工作流）",
+    )
+    user_id: Mapped[int] = mapped_column(ForeignKey("user.id"), nullable=False, index=True, comment="所属用户 id")
+    session_id: Mapped[int] = mapped_column(ForeignKey("sessions.id"), nullable=False, comment="所属会话 id")
+    workflow_type: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        server_default=text("'learning_assessment'"),
+        comment="工作流类型：learning_assessment=学习测评",
+    )
+    status: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        index=True,
+        comment="状态：pending/running/quiz_ready/evaluated/failed",
+    )
+    state_json: Mapped[dict[str, Any] | None] = mapped_column(
+        JSON,
+        nullable=True,
+        comment="完整工作流状态（跨请求恢复题目与评分上下文）",
+    )
+    error_message: Mapped[str | None] = mapped_column(
+        String(1000),
+        nullable=True,
+        comment="失败原因（仅 failed 时有值）",
+    )
+    created_at: Mapped[int] = mapped_column(
+        BigInteger,
+        nullable=False,
+        server_default=unix_timestamp(),
+        comment="创建时间（Unix 秒）",
+    )
+    updated_at: Mapped[int] = mapped_column(
+        BigInteger,
+        nullable=False,
+        server_default=unix_timestamp(),
+        onupdate=_now_unix,
+        comment="更新时间（Unix 秒）",
+    )
+    completed_at: Mapped[int | None] = mapped_column(
+        BigInteger,
+        nullable=True,
+        comment="完成时间（Unix 秒，评分完成后写入）",
     )

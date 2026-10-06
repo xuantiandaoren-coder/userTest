@@ -18,6 +18,9 @@ os.environ["PROMPT_CACHE_WARMUP"] = "false"
 # 上传后自动向量化入库默认关闭，避免用例连 DashScope / Qdrant；
 # 需要验证上传触发 RAG 的用例用 dependency_overrides 注入假实现
 os.environ["RAG_INGEST_ENABLED"] = "false"
+# 长期记忆默认关闭，避免用例加载 fastembed 模型 / 下载权重；
+# 需要验证长期记忆的用例自行 monkeypatch settings 或注入假的向量后端
+os.environ["LONG_TERM_MEMORY_ENABLED"] = "false"
 # JWT 密钥只走环境变量（生产即如此），测试用独立的固定值，长度满足最小要求
 os.environ["JWT_SECRET_KEY"] = "pytest-only-jwt-secret-key-0123456789abcdef"
 

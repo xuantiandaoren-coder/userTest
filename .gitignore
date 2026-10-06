@@ -28,6 +28,10 @@ dist/
 .coverage
 htmlcov/
 
+# onnxruntime / huggingface-xet 在 import fastembed 时写的会话文件（qdrant-client 会间接导入）
+:memory:.ses
+*.ses
+
 # ---- 编辑器 / 系统 ----
 .idea/
 .vscode/

@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import BaseMessage
+from langchain_core.messages import AIMessage, BaseMessage
 from langchain_core.runnables import Runnable
 from sqlalchemy.orm import Session
 from starlette.concurrency import run_in_threadpool
@@ -47,7 +47,13 @@ from app.db.user_profile_repository import UserProfileRepository
 from app.memory.memory import MemoryConfig, MemoryContext
 from app.memory.service import MemoryService
 from app.prompts.injector import profile_to_variables
-from app.prompts.prompt_layer import PromptContext, build_chain, build_system_prompt, stream_tokens
+from app.prompts.prompt_layer import (
+    PromptContext,
+    build_chain,
+    build_system_prompt,
+    merge_system_messages,
+    stream_tokens,
+)
 from app.prompts.prompt_template_manager import PromptTemplateManager
 from app.schemas.chat import StreamChatRequest
 from app.services.chat_service import SessionNotFoundError
@@ -83,6 +89,7 @@ class StreamPlan:
     sources: list[dict[str, Any]] = field(default_factory=list)       # 知识库来源（SSE done 下发）
     references: list[dict[str, Any]] = field(default_factory=list)    # 落库引用：只有 chunk_id + score
     warnings: list[str] = field(default_factory=list)
+    profile_write_intent: bool = False              # 本条消息是否命中长期画像写入意图
 
 
 class StreamChatService:
@@ -109,7 +116,14 @@ class StreamChatService:
         self.persist_factory = persist_factory
         self.model_factory = model_factory
         self.chain = chain
-        self.memory = MemoryService(messages, config=memory_config)
+        # 长期记忆：读画像用请求级 profiles，异步写回写用独立会话工厂，抽取用当前模型
+        self.memory = MemoryService(
+            messages,
+            config=memory_config,
+            profiles=profiles,
+            session_factory=persist_factory,
+            model_factory=(lambda: model),
+        )
 
     # ------------------------------------------------------------------
     # 第一步：准备（可以有 4xx）
@@ -143,12 +157,21 @@ class StreamChatService:
         )
         rendered = build_system_prompt(composed, variables, memory=memory)
 
-        # RAG：按需检索自己的知识库 -> 参考资料拼到本轮问题前 -> system 只补 RAG 回答规则
-        system_prompt, prompt_question, sources, references = self._apply_rag(
-            user_id=user.id,
-            system_prompt=rendered.text,
-            question=payload.message,
-        )
+        # 长期记忆意图：命中画像写入意图说明用户在交代自己的情况，不是知识型提问，跳过 RAG
+        profile_write_intent = self._detect_profile_write_intent(payload.message, user.id)
+        if profile_write_intent:
+            logger.info("命中长期画像写入意图，跳过 RAG 检索 request_user=%s", user.id)
+            system_prompt, prompt_question, sources, references = rendered.text, payload.message, [], []
+        else:
+            # RAG：按需检索自己的知识库 -> 参考资料拼到本轮问题前 -> system 只补 RAG 回答规则
+            system_prompt, prompt_question, sources, references = self._apply_rag(
+                user_id=user.id,
+                system_prompt=rendered.text,
+                question=payload.message,
+            )
+
+        # 长期画像以 SystemMessage 混在历史里，构建最终 system 前统一合并进 system_prompt
+        system_prompt, history = merge_system_messages(system_prompt, list(memory.messages))
 
         return StreamPlan(
             request_id=uuid.uuid4().hex,
@@ -159,7 +182,7 @@ class StreamChatService:
             system_prompt=system_prompt,
             question=payload.message,     # 原始提问落库 / 进历史，注入的参考资料不落库
             prompt_question=prompt_question,
-            history=memory.messages,
+            history=history,
             model=self._resolve_model(agent),
             select_model=agent.select_model if agent.select_model is not None else 0,
             prompt_versions=composed.version_label,
@@ -167,7 +190,19 @@ class StreamChatService:
             sources=sources,
             references=references,
             warnings=[*rendered.warnings, *memory.warnings],
+            profile_write_intent=profile_write_intent,
         )
+
+    def _detect_profile_write_intent(self, message: str, user_id: int) -> bool:
+        """判断本轮是否命中长期画像写入意图；判断失败按不写入处理。"""
+        long_term = self.memory.long_term
+        if long_term is None or not long_term.enabled:
+            return False
+        try:
+            return long_term.should_write(message, user_id)
+        except Exception as exc:  # noqa: BLE001 - 意图判断是增强项，失败不能让本轮对话不可用
+            logger.warning("长期画像写入意图判断失败，按不写入处理：%r", exc)
+            return False
 
     def _apply_rag(
         self,
@@ -259,6 +294,7 @@ class StreamChatService:
 
         answer = "".join(buffer)
         message_id = await self._persist_quietly(plan, answer, reason="done")
+        self._maybe_submit_profile_update(plan, answer)
         yield sse_event(
             EVENT_DONE,
             {
@@ -273,6 +309,22 @@ class StreamChatService:
             },
         )
 
+    def _maybe_submit_profile_update(self, plan: StreamPlan, answer: str) -> None:
+        """命中画像写入意图时，用最近 4 条历史 + 本轮 AI 回复触发异步画像抽取。
+
+        后台线程独立于 SSE 响应，不阻塞 done 事件下发；失败只记日志。
+        """
+        if not plan.profile_write_intent:
+            return
+        long_term = self.memory.long_term
+        if long_term is None or not long_term.enabled:
+            return
+        try:
+            context: list[BaseMessage] = [*plan.history[-4:], AIMessage(content=answer)]
+            long_term.submit_profile_update_async(plan.user_id, plan.question, context)
+        except Exception as exc:  # noqa: BLE001 - 画像更新是增强项，失败不能让本轮对话报错
+            logger.error("长期画像异步更新提交失败 request_id=%s：%r", plan.request_id, exc, exc_info=exc)
+
     # ------------------------------------------------------------------
     # 落库
     # ------------------------------------------------------------------
@@ -282,13 +334,17 @@ class StreamChatService:
             logger.info("空回答不落库 request_id=%s reason=%s", plan.request_id, reason)
             return None
         try:
-            return await run_in_threadpool(self._persist_sync, plan, answer)
+            return await run_in_threadpool(self._persist_sync, plan, answer, reason)
         except Exception as exc:
             logger.error("聊天记录落库失败 request_id=%s reason=%s：%r", plan.request_id, reason, exc, exc_info=exc)
             return None
 
-    def _persist_sync(self, plan: StreamPlan, answer: str) -> int:
-        """用独立会话写入一轮问答（不依赖请求级会话的生命周期）。"""
+    def _persist_sync(self, plan: StreamPlan, answer: str, reason: str = "done") -> int:
+        """用独立会话写入一轮问答（不依赖请求级会话的生命周期）。
+
+        这一轮问答落库后就是下一个请求的「短期记忆」（``InstantMemory`` 按会话读取），
+        因此写入成功后记一条短期记忆日志，方便排查「历史没带上 / 轮次对不上」。
+        """
         if self.persist_factory is None:
             raise RuntimeError("未配置 persist_factory，无法落库")
         session = self.persist_factory()
@@ -304,6 +360,18 @@ class StreamChatService:
                 reference_sources=plan.references or None,
             )
             session.commit()
+            logger.info(
+                "短期记忆写入成功 user_id=%s session_id=%s message_id=%s request_id=%s reason=%s "
+                "提问字符=%s 回答字符=%s references=%s",
+                plan.user_id,
+                plan.session_id,
+                message.id,
+                plan.request_id,
+                reason,
+                len(plan.question or ""),
+                len(answer or ""),
+                len(plan.references or []),
+            )
             return message.id
         except Exception:
             session.rollback()

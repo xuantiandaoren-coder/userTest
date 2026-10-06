@@ -180,6 +180,17 @@ class Settings(BaseSettings):
     # 上传文件后自动向量化入库；失败只记日志、不影响上传结果（向量化是增强能力）
     rag_ingest_enabled: bool = True
 
+    # ------------------------------------------------------------------
+    # 长期记忆（见 app/memory/long_term_memory.py）：跨会话用户画像沉淀
+    # ------------------------------------------------------------------
+    long_term_memory_enabled: bool = True           # 总开关：关掉后不读也不写长期画像
+    # 写入意图判断用的本地向量模型（fastembed），用于和画像例句做语义相似度
+    long_term_embedding_model: str = "BAAI/bge-small-zh-v1.5"
+    # 语义相似度阈值：高于该值判定为「用户在提供画像信息」
+    long_term_similarity_threshold: float = 0.60
+    # 正负对照的最小差距：与画像句的相似度要比与非画像句高出这么多才判定命中
+    long_term_similarity_margin: float = 0.08
+
     # 生产默认关闭接口文档，避免暴露内部接口清单
     docs_enabled: bool = Field(default_factory=lambda: current_env() is Env.DEV)
 

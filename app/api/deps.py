@@ -20,9 +20,11 @@ from app.db.session_repository import ChatSessionRepository
 from app.db.session import get_db, get_session_factory
 from app.db.user_repository import UserRepository
 from app.db.user_profile_repository import UserProfileRepository
+from app.db.workflow_run_repository import WorkflowRunRepository
 from app.llm.llm import get_chat_model
 from app.prompts.prompt_template_manager import PromptTemplateManager
 from app.services.chat_service import ChatService
+from app.services.learning_workflow_service import LearningWorkflowService
 from app.services.rag_service import RagIngestService
 from app.services.stream_chat_service import StreamChatService
 from app.services.upload_service_seaweedfs import SeaweedFSUploadService
@@ -159,3 +161,29 @@ def get_stream_chat_service(
 
 
 StreamChatServiceDep = Annotated[StreamChatService, Depends(get_stream_chat_service)]
+
+
+# ---------------------------------------------------------------------------
+# 学习测评工作流依赖
+# ---------------------------------------------------------------------------
+def get_workflow_model_factory() -> Callable[[str | None], BaseChatModel]:
+    """依赖注入：工作流用的模型工厂（按 provider 解析，测试可整体替换为假模型）。"""
+    return lambda provider=None: get_chat_model(provider=provider)
+
+
+WorkflowModelFactoryDep = Annotated[Callable[[str | None], BaseChatModel], Depends(get_workflow_model_factory)]
+
+
+def get_learning_workflow_service(
+    db: Annotated[Session, Depends(get_db)],
+    model_factory: WorkflowModelFactoryDep,
+) -> LearningWorkflowService:
+    """依赖注入：学习测评工作流服务（运行表 + 会话校验 + 模型工厂）。"""
+    return LearningWorkflowService(
+        runs=WorkflowRunRepository(db),
+        sessions=ChatSessionRepository(db),
+        model_factory=model_factory,
+    )
+
+
+LearningWorkflowServiceDep = Annotated[LearningWorkflowService, Depends(get_learning_workflow_service)]

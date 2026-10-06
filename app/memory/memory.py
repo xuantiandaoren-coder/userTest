@@ -78,12 +78,13 @@ class SearchHit:
 
 @dataclass
 class MemoryContext:
-    """记忆层产出：历史消息 + 检索增强文本。"""
+    """记忆层产出：历史消息 + 检索增强文本 + 长期画像。"""
 
     messages: list[BaseMessage] = field(default_factory=list)     # 历史（已截断）
     turns: list[tuple[str, str]] = field(default_factory=list)     # 原始 (提问, 回答)
     search_context: str = ""                                       # 检索增强文本块
     search_hits: list[SearchHit] = field(default_factory=list)
+    long_term_text: str = ""                                       # 长期画像文本（已包装为 SystemMessage 进 messages）
     warnings: list[str] = field(default_factory=list)
 
     @property

@@ -23,6 +23,8 @@ dependencies = [
     # 递归切片器：langchain 1.x 起 text splitters 独立成包（app/rag/core.py 用）
     "langchain-text-splitters>=0.3",
     "langchain-openai>=0.3",
+    # 学习测评工作流编排（app/workflows/learning_assessment.py 的 StateGraph）
+    "langgraph>=1.0",
     "redis>=5.0",
     # RAG 文件向量化入库（app/rag/core.py）：解析 / 向量化 / 向量库
     "python-docx>=1.1",
@@ -31,6 +33,8 @@ dependencies = [
     "pillow>=10.0",
     "dashscope>=1.20",
     "qdrant-client>=1.9",
+    # 长期记忆写入意图判断：本地向量化（BAAI/bge-small-zh-v1.5），不依赖外部 API
+    "fastembed>=0.4",
 ]
 
 [dependency-groups]
